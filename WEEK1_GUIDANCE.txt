@@ -1,0 +1,510 @@
+
+================================================================================
+  GitBrain — Week 1 Implementation Guidance
+  Beginner-Friendly Mentor Guide
+================================================================================
+  Project: GitBrain — AI-Powered GitHub Repository Intelligence Assistant
+  Phase:   Week 1 — Foundation: GitHub Ingestion + Code Chunking
+  Stack:   Python · GitHub REST API · ast module · python-dotenv · requests
+================================================================================
+
+
+────────────────────────────────────────────────────────────────────────────────
+WHAT WAS BUILT IN WEEK 1
+────────────────────────────────────────────────────────────────────────────────
+
+Week 1 builds the FOUNDATION of GitBrain.
+
+No AI, no vectors, no database, no web interface yet.
+Just clean Python code that does two very important things:
+
+  TASK 1 — INGESTION (core/github_ingester.py)
+    → Connect to GitHub's REST API
+    → Fetch all code files from any public repository
+    → Filter out images, binaries, lock files, and node_modules
+    → Return clean text content with file path and language
+
+  TASK 2 — CHUNKING (core/code_chunker.py)
+    → Split each file into small, meaningful pieces called "chunks"
+    → For Python files: extract exact functions and classes using the AST
+    → For other files: use a sliding window (overlapping blocks of 60 lines)
+    → Store the file path, line numbers, and code type with each chunk
+
+By the end of Week 1, running one command should print 50–500 chunks
+from any public GitHub repository, with correct metadata on each chunk.
+
+These chunks are the raw material that Week 3 will embed into vectors
+and store in ChromaDB so they can be semantically searched.
+
+
+────────────────────────────────────────────────────────────────────────────────
+GENERATED FILE STRUCTURE
+────────────────────────────────────────────────────────────────────────────────
+
+gitbrain/
+│
+├── core/
+│   ├── __init__.py            — marks 'core' as a Python package
+│   ├── github_ingester.py     — fetches files from GitHub API
+│   └── code_chunker.py        — splits files into chunks
+│
+├── utils/
+│   ├── __init__.py            — marks 'utils' as a Python package
+│   └── repo_parser.py         — parses GitHub URLs into owner + repo
+│
+├── test_ingester.py           — CLI test script (run this to test Week 1)
+├── requirements.txt           — Python dependencies list
+├── .env.example               — template for environment variables
+├── .gitignore                 — tells Git which files to ignore
+└── WEEK1_GUIDANCE.txt         — THIS FILE
+
+
+────────────────────────────────────────────────────────────────────────────────
+WHAT EACH FILE DOES
+────────────────────────────────────────────────────────────────────────────────
+
+.env.example
+  Template for your secrets file. Contains variable names without values.
+  You copy this to .env and fill in your GitHub token.
+  NEVER commit .env to Git.
+
+.gitignore
+  Tells Git to ignore .env, venv/, and Python cache files.
+  This prevents your API keys from being accidentally published to GitHub.
+
+requirements.txt
+  Lists the two Python packages Week 1 needs:
+    - requests     → makes HTTP calls to the GitHub API
+    - python-dotenv → reads your .env file into environment variables
+  Install them with:  pip install -r requirements.txt
+
+utils/repo_parser.py
+  A small helper with two functions:
+    - parse_github_url(url) → returns (owner, repo)
+      Example: parse_github_url("https://github.com/tiangolo/fastapi")
+               returns ("tiangolo", "fastapi")
+    - make_collection_name(owner, repo) → returns "tiangolo__fastapi"
+      This sanitized name will be used as the ChromaDB collection name in Week 3.
+
+core/github_ingester.py
+  The most important file in Week 1. Contains:
+
+    get_headers(token)
+      Builds the Authorization header for GitHub API requests.
+      Without a token: 60 req/hour. With a token: 5,000 req/hour.
+
+    should_skip_file(path, size)
+      Returns True if a file should be skipped.
+      Skips: images, videos, archives, minified JS, node_modules, .git, etc.
+
+    detect_language(path)
+      Reads the file extension and returns a language string.
+      ".py" → "python", ".js" → "javascript", ".go" → "go", etc.
+
+    fetch_file_tree(owner, repo, token)
+      Calls GitHub's Git Trees API to get every file path in the repo in
+      a single API request. Returns a list of {path, sha, size} dicts.
+
+    fetch_file_content(owner, repo, path, token)
+      Calls GitHub's Contents API to get the raw text of one file.
+      GitHub returns content as Base64 — this function decodes it.
+      Includes rate-limit awareness: pauses if < 10 requests remaining.
+
+    fetch_repository_files(owner, repo, token, max_files)
+      Orchestrates the above: calls fetch_file_tree, then fetches each file.
+      Returns a list of {path, content, language, size} dicts.
+      This is the function called by test_ingester.py.
+
+core/code_chunker.py
+  Splits files into chunks. Contains:
+
+    chunk_file(content, file_path, language)
+      The main entry point. Chooses which chunking strategy to use.
+      Python → AST-based. Everything else → sliding window.
+
+    chunk_python_file(content, file_path)
+      Uses Python's built-in ast module to parse the file into a syntax tree.
+      Extracts every function definition (def ...) and class definition (class ...).
+      Also extracts methods within classes as separate chunks.
+      Returns chunks with exact start_line and end_line from the AST.
+
+    fallback_chunk_text(content, file_path, language)
+      Used for non-Python files.
+      Splits into windows of 60 lines with 10-line overlap between windows.
+      Returns chunks named "window_1", "window_2", etc.
+
+    chunk_all_files(files)
+      Calls chunk_file() on every file in the files list.
+      Returns one flat list of all chunks across all files.
+
+test_ingester.py
+  The end-to-end test script for Week 1.
+  Run this from the terminal with a GitHub URL.
+  It calls repo_parser → github_ingester → code_chunker in order,
+  then prints the chunks with metadata and a validation summary.
+
+
+────────────────────────────────────────────────────────────────────────────────
+HOW TO INSTALL DEPENDENCIES
+────────────────────────────────────────────────────────────────────────────────
+
+WINDOWS (Command Prompt or PowerShell):
+  cd gitbrain
+  python -m venv venv
+  venv\Scripts\activate
+  pip install -r requirements.txt
+
+MAC / LINUX (Terminal):
+  cd gitbrain
+  python3 -m venv venv
+  source venv/bin/activate
+  pip install -r requirements.txt
+
+After installation, you should see something like:
+  Successfully installed requests-2.32.3 python-dotenv-1.0.1
+
+VERIFY installation:
+  python -c "import requests, dotenv; print('OK')"
+  Should print: OK
+
+
+────────────────────────────────────────────────────────────────────────────────
+HOW TO ADD YOUR GITHUB TOKEN
+────────────────────────────────────────────────────────────────────────────────
+
+Step 1: Get a GitHub Personal Access Token
+  → Go to: https://github.com/settings/tokens
+  → Click: "Generate new token (classic)"
+  → Give it a name like "GitBrain"
+  → Select scope: "repo" (for public repos, no scope is needed — but repo scope
+    gives 5,000 requests/hour instead of 60/hour)
+  → Click "Generate token"
+  → COPY the token now — you won't see it again
+
+Step 2: Create your .env file
+  WINDOWS:   copy .env.example .env
+  MAC/LINUX: cp .env.example .env
+
+Step 3: Edit the .env file
+  Open .env in any text editor and change:
+    GITHUB_TOKEN=
+  to:
+    GITHUB_TOKEN=ghp_yourtokenhere
+
+Step 4: Verify it works
+  python -c "from dotenv import load_dotenv; import os; load_dotenv(); print('Token loaded:', bool(os.getenv('GITHUB_TOKEN')))"
+  Should print: Token loaded: True
+
+
+────────────────────────────────────────────────────────────────────────────────
+HOW TO RUN THE TEST
+────────────────────────────────────────────────────────────────────────────────
+
+Make sure your virtual environment is activated first!
+
+WINDOWS:   venv\Scripts\activate
+MAC/LINUX: source venv/bin/activate
+
+Then run:
+  python test_ingester.py https://github.com/tiangolo/fastapi
+
+Or try a smaller repo for faster testing:
+  python test_ingester.py https://github.com/pallets/flask
+  python test_ingester.py https://github.com/psf/requests
+
+You can also test the self-tests of individual modules:
+  python utils/repo_parser.py
+  python core/code_chunker.py
+
+
+────────────────────────────────────────────────────────────────────────────────
+HOW THE FILES CONNECT (EXECUTION FLOW)
+────────────────────────────────────────────────────────────────────────────────
+
+When you run:
+  python test_ingester.py https://github.com/tiangolo/fastapi
+
+Here is exactly what happens, step by step:
+
+  1. test_ingester.py starts
+     → reads the URL from sys.argv[1]
+
+  2. utils/repo_parser.py → parse_github_url()
+     → "https://github.com/tiangolo/fastapi"
+        becomes owner="tiangolo", repo="fastapi"
+
+  3. os.getenv("GITHUB_TOKEN") reads your token from .env
+     → loaded by dotenv at the top of test_ingester.py
+
+  4. core/github_ingester.py → fetch_repository_files()
+     → calls fetch_file_tree() first:
+        GET https://api.github.com/repos/tiangolo/fastapi
+        GET https://api.github.com/repos/tiangolo/fastapi/branches/master
+        GET https://api.github.com/repos/tiangolo/fastapi/git/trees/{sha}?recursive=1
+        → returns list of file paths
+        → should_skip_file() filters out binary files
+     → then loops and calls fetch_file_content() for each file:
+        GET https://api.github.com/repos/tiangolo/fastapi/contents/{path}
+        → decodes base64 content
+        → detect_language() sets the language field
+     → returns list of {path, content, language, size}
+
+  5. core/code_chunker.py → chunk_all_files()
+     → for each Python file: calls chunk_python_file()
+        → ast.parse() builds the syntax tree
+        → extracts FunctionDef and ClassDef nodes
+        → records exact start_line and end_line from ast
+     → for other files: calls fallback_chunk_text()
+        → splits into 60-line windows with 10-line overlap
+     → returns flat list of all chunks
+
+  6. test_ingester.py prints:
+     → chunk statistics (language breakdown, chunk type breakdown)
+     → first 20 chunks with metadata
+     → Week 1 validation summary
+
+
+────────────────────────────────────────────────────────────────────────────────
+EXPECTED TERMINAL OUTPUT
+────────────────────────────────────────────────────────────────────────────────
+
+======================================================================
+  GitBrain — Week 1 Ingestion Test
+======================================================================
+
+  ── STEP 1: Parsing Repository URL ────────────────────────────────
+  Input URL : https://github.com/tiangolo/fastapi
+  Owner     : tiangolo
+  Repo      : fastapi
+  Collection: tiangolo__fastapi  (for ChromaDB in Week 3)
+  ✓ URL parsed successfully
+
+  ── STEP 2: GitHub Authentication ─────────────────────────────────
+  ✓ GitHub token loaded (first 8 chars: ghp_abcd...)
+    Rate limit: 5,000 requests/hour
+
+  ── STEP 3: Fetching Files from GitHub ────────────────────────────
+[GitBrain] Fetching file tree for: tiangolo/fastapi
+  [  10/100] Fetching: fastapi/applications.py
+  [  20/100] Fetching: fastapi/routing.py
+  ...
+[GitBrain] ✓ Fetch complete!
+           Files fetched with content : 87
+           Files empty / skipped      : 3
+
+  ✓ Files fetched successfully: 87 files with content
+
+  ── STEP 4: Chunking Code Files ───────────────────────────────────
+  Processing 87 files...
+  [Chunker] [  20/ 87] fastapi/routing.py → 12 chunks
+  [Chunker] [  40/ 87] fastapi/dependencies/utils.py → 8 chunks
+  ...
+
+  ✓ Chunking complete!
+    Total chunks generated : 423
+    Time elapsed           : 47.3 seconds
+
+  ── STEP 5: Chunk Statistics ──────────────────────────────────────
+
+  Language breakdown:
+    python         312  ████████████████████████████████
+    markdown        45  █████
+    yaml            28  ███
+    text            38  ████
+
+  Chunk type breakdown:
+    function       198  ████████████████████
+    method         89   █████████
+    class          25   ███
+    window        111   ███████████
+
+  Average chunk size : 18.4 lines  (412 characters)
+
+  ── STEP 6: First 20 Chunks ───────────────────────────────────────
+
+  ┌─ Chunk #1 ──────────────────────────────────────────────────────
+  │  File      : fastapi/applications.py
+  │  Name      : FastAPI
+  │  Type      : class
+  │  Language  : python
+  │  Lines     : 44 – 568
+  │  Length    : 14203 characters
+  │  Preview   : 'class FastAPI(Starlette):\n    """\n    `FastAPI` app...'
+  └────────────────────────────────────────────────────────────────
+
+  ... (more chunks) ...
+
+  ── WEEK 1 VALIDATION SUMMARY ─────────────────────────────────────
+
+  ✓  Repository URL parsed correctly
+  ✓  87 files fetched from GitHub
+  ✓  Binary files filtered out
+  ✓  312 Python function/class chunks extracted
+  ✓  111 sliding window chunks for other languages
+  ✓  All chunks have valid line numbers
+  ✓  No API key exposed in output
+  ✓  423 chunks ready for embedding (Week 3)
+
+======================================================================
+  WEEK 1 COMPLETE ✓
+  423 chunks generated from 87 files in 47.3 seconds
+  ...
+======================================================================
+
+
+────────────────────────────────────────────────────────────────────────────────
+COMMON ERRORS AND FIXES
+────────────────────────────────────────────────────────────────────────────────
+
+ERROR: ModuleNotFoundError: No module named 'requests'
+  FIX: Your virtual environment is not activated or dependencies not installed.
+       Run: venv\Scripts\activate  (Windows)  or  source venv/bin/activate  (Mac/Linux)
+       Then: pip install -r requirements.txt
+
+ERROR: ModuleNotFoundError: No module named 'dotenv'
+  FIX: python-dotenv is not installed.
+       Run: pip install python-dotenv
+
+ERROR: RuntimeError: Repository not found
+  FIX: Check the URL is correct and the repository exists.
+       Try: https://github.com/tiangolo/fastapi  (a known public repo)
+
+ERROR: RuntimeError: GitHub API access forbidden (HTTP 403)
+  FIX: You've hit the rate limit (60 req/hour without a token).
+       Add your GitHub token to .env:  GITHUB_TOKEN=ghp_yourtoken
+       Wait ~60 minutes for the rate limit to reset.
+
+ERROR: Token loaded: False (when testing .env loading)
+  FIX: Did you create the .env file (not .env.example)?
+       Run: copy .env.example .env  (Windows)  or  cp .env.example .env  (Mac/Linux)
+       Then edit .env and add your token after the = sign.
+
+ERROR: SyntaxError: invalid syntax inside code_chunker
+  FIX: This should not happen — code_chunker.py handles parse errors internally.
+       If a Python file in the repo has a syntax error, ast.parse() catches it
+       and falls back to sliding window chunking for that file.
+
+ERROR: 0 chunks generated
+  FIX: Either the repo has very few code files, or all files are being skipped.
+       Try a different repo: python test_ingester.py https://github.com/psf/requests
+
+ERROR: python: command not found  (Mac/Linux)
+  FIX: Use python3 instead of python:
+       python3 -m venv venv
+       python3 test_ingester.py https://github.com/tiangolo/fastapi
+
+ERROR: 'venv\Scripts\activate' is not recognized  (Windows)
+  FIX: Make sure you are in the gitbrain/ folder.
+       Run: dir  and check that venv/ folder exists.
+       If not, run: python -m venv venv  first.
+
+SLOW PERFORMANCE (taking 10+ minutes for small repos)
+  FIX: This is expected without a GitHub token — each API call delays more.
+       Add GITHUB_TOKEN to your .env to unlock 5,000 requests/hour.
+       For testing, use repos with < 50 files to save time.
+
+
+────────────────────────────────────────────────────────────────────────────────
+WEEK 1 VALIDATION CHECKLIST
+────────────────────────────────────────────────────────────────────────────────
+
+After running the test script, verify each of these:
+
+  □ Repository URL was parsed into owner and repo name correctly
+  □ At least 1 file was fetched from GitHub
+  □ Binary files (.png, .zip, etc.) are NOT in the output
+  □ node_modules / .git files are NOT in the output
+  □ At least 1 Python file produced "function" or "class" type chunks
+  □ Each chunk shows a start_line and end_line (both > 0)
+  □ start_line <= end_line for every chunk
+  □ Your GitHub token is NOT visible anywhere in the terminal output
+  □ Running the script twice gives the same chunk count
+  □ The script exits with "WEEK 1 COMPLETE ✓"
+
+
+────────────────────────────────────────────────────────────────────────────────
+WHAT NOT TO BUILD IN WEEK 1
+────────────────────────────────────────────────────────────────────────────────
+
+  ✗ DO NOT build a frontend (Streamlit, Flask, HTML)
+    → That is Week 5. Focus on the data pipeline now.
+
+  ✗ DO NOT connect to Groq or any LLM API
+    → That is Week 4. No LLM is needed for Week 1.
+
+  ✗ DO NOT install or use ChromaDB
+    → That is Week 3. For now, just print the chunks to the terminal.
+
+  ✗ DO NOT build FastAPI endpoints
+    → That is Week 4. The test script is sufficient for Week 1 validation.
+
+  ✗ DO NOT try to handle private repositories with OAuth
+    → A personal access token in .env is the right approach for this project.
+
+  ✗ DO NOT try to make the chunker perfect for every language
+    → The sliding window fallback is good enough for Week 1.
+       Language-specific improvements can come in Phase 2.
+
+  ✗ DO NOT add a database of any kind
+    → Week 1 output is just printed to the terminal.
+
+
+────────────────────────────────────────────────────────────────────────────────
+WHAT COMES NEXT — WEEK 3 PREVIEW
+────────────────────────────────────────────────────────────────────────────────
+
+In Week 3, you will build on Week 1's output:
+
+  core/embedder.py
+    → Takes each chunk's text
+    → Passes it to sentence-transformers (all-MiniLM-L6-v2)
+    → Returns a 384-dimensional vector (an array of 384 floats)
+
+  core/vector_store.py
+    → Saves each chunk + its vector into ChromaDB
+    → ChromaDB stores them on disk in a folder called chroma_db/
+
+  test_search.py (new)
+    → Embeds a natural language query: "how does routing work?"
+    → Searches ChromaDB for the most similar chunks
+    → Prints the top 5 most relevant code chunks
+
+New packages to install in Week 3:
+  pip install chromadb sentence-transformers
+
+
+────────────────────────────────────────────────────────────────────────────────
+QUICK COMMAND REFERENCE
+────────────────────────────────────────────────────────────────────────────────
+
+  Create virtual environment:
+    python -m venv venv                           (Windows)
+    python3 -m venv venv                          (Mac/Linux)
+
+  Activate virtual environment:
+    venv\Scripts\activate                          (Windows)
+    source venv/bin/activate                       (Mac/Linux)
+
+  Install dependencies:
+    pip install -r requirements.txt
+
+  Copy env template:
+    copy .env.example .env                         (Windows)
+    cp .env.example .env                           (Mac/Linux)
+
+  Run the Week 1 test:
+    python test_ingester.py https://github.com/tiangolo/fastapi
+    python test_ingester.py https://github.com/psf/requests
+    python test_ingester.py https://github.com/pallets/flask
+
+  Run individual module self-tests:
+    python utils/repo_parser.py
+    python core/code_chunker.py
+
+  Check token is loading:
+    python -c "from dotenv import load_dotenv; import os; load_dotenv(); print('Token:', bool(os.getenv('GITHUB_TOKEN')))"
+
+================================================================================
+  END OF WEEK 1 GUIDANCE
+  Good luck! One step at a time. Build → Test → Verify → Move on.
+================================================================================
