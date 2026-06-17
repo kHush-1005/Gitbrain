@@ -1,259 +1,222 @@
 """
-test_ingester.py
+test_ingester.py  [UPDATED — Week 2]
 ─────────────────────────────────────────────────────────────────────────────
-PURPOSE:
-    Week 1 end-to-end test script.
+CHANGES FROM WEEK 1:
+    ✓ Uses updated github_ingester (now returns summary dict too)
+    ✓ Uses updated code_chunker (JS heuristic chunks, richer metadata)
+    ✓ Prints token_estimate alongside char_count for each chunk
+    ✓ Offers to save chunks to disk at the end (uses export_chunks pipeline)
+    ✓ Still works with the exact same command as Week 1:
 
-    Run this from the command line to verify that:
-        ✓ A GitHub repo URL can be parsed
-        ✓ Files can be fetched from GitHub
-        ✓ Files are chunked into meaningful pieces
-        ✓ Chunk metadata (file path, line numbers) is correct
+        python test_ingester.py https://github.com/owner/repo
 
-USAGE:
-    python test_ingester.py https://github.com/owner/repo
-    python test_ingester.py https://github.com/tiangolo/fastapi
-    python test_ingester.py https://github.com/psf/requests
+    ✓ Optional --save flag to write JSONL without running export_chunks.py:
 
-OPTIONS (edit the CONFIG section below):
-    MAX_FILES    — Maximum number of files to fetch (default: 100)
-    SHOW_CHUNKS  — How many chunks to print in detail (default: 20)
-    SHOW_PREVIEW — Number of characters to show from each chunk (default: 120)
+        python test_ingester.py https://github.com/owner/repo --save
 ─────────────────────────────────────────────────────────────────────────────
 """
 
 import sys
 import os
-import logging
 import time
+import logging
+import argparse
+from collections import Counter
 
-# ─── Load environment variables from .env ─────────────────────────────────────
 from dotenv import load_dotenv
 load_dotenv()
 
-# ─── Import our Week 1 modules ────────────────────────────────────────────────
-from utils.repo_parser import parse_github_url, make_collection_name
-from core.github_ingester import fetch_repository_files
+from utils.repo_parser    import parse_github_url, make_collection_name
+from core.github_ingester import (
+    fetch_repository_files, RepoNotFoundError,
+    GitHubRateLimitError, GitHubAPIError
+)
 from core.code_chunker import chunk_all_files
 
-# ─── CONFIG ───────────────────────────────────────────────────────────────────
-MAX_FILES    = 100   # safety cap — increase for larger repos
-SHOW_CHUNKS  = 20    # number of chunks to display in detail
-SHOW_PREVIEW = 120   # characters of chunk text to show in preview
-
-# ─── Logging setup ────────────────────────────────────────────────────────────
 logging.basicConfig(
-    level=logging.WARNING,   # Change to logging.DEBUG to see all API calls
+    level=logging.WARNING,
     format="%(levelname)s | %(name)s | %(message)s"
 )
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-def print_header():
-    print()
-    print("=" * 70)
-    print("  GitBrain — Week 1 Ingestion Test")
-    print("=" * 70)
+SHOW_CHUNKS  = 20
+SHOW_PREVIEW = 130
 
 
-def print_divider(title: str = ""):
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="GitBrain — test ingestion and chunking from the terminal."
+    )
+    parser.add_argument("repo_url", help="GitHub repository URL")
+    parser.add_argument("--max-files", type=int, default=100,
+                        help="Maximum files to fetch (default: 100)")
+    parser.add_argument("--save", action="store_true",
+                        help="Also save chunks to data/chunks/ as JSONL")
+    return parser.parse_args()
+
+
+def print_divider(title=""):
     print()
     if title:
-        print(f"  ── {title} " + "─" * (60 - len(title)))
+        print(f"  ── {title} " + "─" * max(2, 60 - len(title)))
     else:
         print("  " + "─" * 66)
 
 
 def print_chunk(chunk: dict, index: int):
-    """Pretty-print a single chunk with its metadata."""
     print(f"\n  ┌─ Chunk #{index + 1} " + "─" * 50)
     print(f"  │  File      : {chunk['file_path']}")
     print(f"  │  Name      : {chunk['chunk_name']}")
     print(f"  │  Type      : {chunk['chunk_type']}")
     print(f"  │  Language  : {chunk['language']}")
     print(f"  │  Lines     : {chunk['start_line']} – {chunk['end_line']}")
-    print(f"  │  Length    : {len(chunk['text'])} characters")
-
-    # Show a preview of the chunk text
-    preview = chunk['text'].replace('\n', '↵ ')[:SHOW_PREVIEW]
-    if len(chunk['text']) > SHOW_PREVIEW:
+    print(f"  │  Size      : {chunk['char_count']} chars  (~{chunk['token_estimate']} tokens)")
+    preview = chunk["text"].replace("\n", "↵ ")[:SHOW_PREVIEW]
+    if len(chunk["text"]) > SHOW_PREVIEW:
         preview += "..."
     print(f"  │  Preview   : {preview!r}")
     print(f"  └" + "─" * 60)
 
 
-def print_language_breakdown(chunks: list[dict]):
-    """Show how many chunks came from each language."""
-    from collections import Counter
-    lang_counts = Counter(c["language"] for c in chunks)
-    type_counts = Counter(c["chunk_type"] for c in chunks)
-
-    print()
-    print("  Language breakdown:")
-    for lang, count in lang_counts.most_common():
-        bar = "█" * min(count, 40)
-        print(f"    {lang:<15} {count:>4}  {bar}")
-
-    print()
-    print("  Chunk type breakdown:")
-    for ctype, count in type_counts.most_common():
-        bar = "█" * min(count, 40)
-        print(f"    {ctype:<15} {count:>4}  {bar}")
-
-
-def run_week1_test(repo_url: str):
-    """
-    Run the full Week 1 ingestion test for a given GitHub repository URL.
-    """
-    print_header()
+def run_test(repo_url: str, max_files: int, save: bool):
     start_time = time.time()
 
-    # ── STEP 1: Parse the URL ──────────────────────────────────────────────────
+    print()
+    print("=" * 70)
+    print("  GitBrain — Week 2 Ingestion Test")
+    print("=" * 70)
+
+    # ── Parse URL ─────────────────────────────────────────────────────────────
     print_divider("STEP 1: Parsing Repository URL")
-    print(f"  Input URL : {repo_url}")
     try:
         owner, repo = parse_github_url(repo_url)
     except ValueError as e:
         print(f"\n  ✗ ERROR: {e}")
-        print("  Make sure the URL looks like: https://github.com/owner/repo")
         sys.exit(1)
 
     collection_name = make_collection_name(owner, repo)
-    print(f"  Owner     : {owner}")
-    print(f"  Repo      : {repo}")
-    print(f"  Collection: {collection_name}  (for ChromaDB in Week 3)")
+    print(f"  Input URL   : {repo_url}")
+    print(f"  Owner       : {owner}")
+    print(f"  Repo        : {repo}")
+    print(f"  Collection  : {collection_name}  (ChromaDB key for Week 3)")
     print(f"  ✓ URL parsed successfully")
 
-    # ── STEP 2: Read GitHub token from environment ─────────────────────────────
+    # ── Auth ──────────────────────────────────────────────────────────────────
     print_divider("STEP 2: GitHub Authentication")
     token = os.getenv("GITHUB_TOKEN", "")
     if token:
-        print(f"  ✓ GitHub token loaded (first 8 chars: {token[:8]}...)")
-        print(f"    Rate limit: 5,000 requests/hour")
+        print(f"  ✓ Token loaded (first 8: {token[:8]}...)  — 5,000 req/hr")
     else:
-        print(f"  ⚠ No GitHub token found in .env file.")
-        print(f"    Rate limit: 60 requests/hour (may fail on large repos)")
-        print(f"    → Add GITHUB_TOKEN=your_token to your .env file to fix this")
+        print("  ⚠  No token in .env — 60 req/hr (may be slow on large repos)")
 
-    # ── STEP 3: Fetch files from GitHub ───────────────────────────────────────
+    # ── Fetch ─────────────────────────────────────────────────────────────────
     print_divider("STEP 3: Fetching Files from GitHub")
     try:
-        files = fetch_repository_files(
-            owner=owner,
-            repo=repo,
-            token=token,
-            max_files=MAX_FILES,
+        files, summary = fetch_repository_files(
+            owner=owner, repo=repo, token=token, max_files=max_files
         )
-    except RuntimeError as e:
-        print(f"\n  ✗ GitHub API ERROR:\n    {e}")
+    except RepoNotFoundError as e:
+        print(f"\n  ✗ Repo Error: {e}")
+        sys.exit(1)
+    except GitHubRateLimitError as e:
+        print(f"\n  ✗ Rate Limit: {e}")
+        sys.exit(1)
+    except GitHubAPIError as e:
+        print(f"\n  ✗ API Error: {e}")
         sys.exit(1)
 
     if not files:
-        print("\n  ✗ No files were fetched. Possible reasons:")
-        print("    - Repository has no code files")
-        print("    - All files were filtered out (binary/empty)")
-        print("    - Invalid repository URL")
+        print("\n  ✗ No files fetched.")
         sys.exit(1)
 
-    print(f"\n  ✓ Files fetched successfully: {len(files)} files with content")
-
-    # ── Show which languages were found ───────────────────────────────────────
-    from collections import Counter
+    print(f"\n  ✓ {len(files)} files fetched  |  {summary['empty']} empty/skipped")
     lang_summary = Counter(f["language"] for f in files)
     print("\n  Languages found:")
     for lang, count in lang_summary.most_common(8):
-        print(f"    {lang:<15} {count} files")
+        print(f"    {lang:<18} {count}")
 
-    # ── STEP 4: Chunk the files ────────────────────────────────────────────────
-    print_divider("STEP 4: Chunking Code Files")
+    # ── Chunk ─────────────────────────────────────────────────────────────────
+    print_divider("STEP 4: Chunking Files")
     print(f"  Processing {len(files)} files...\n")
+    chunks = chunk_all_files(files, repo_name=collection_name)
 
-    all_chunks = chunk_all_files(files)
-
-    if not all_chunks:
-        print("\n  ✗ No chunks were generated. This is unexpected.")
-        print("    Check that the fetched files are not empty.")
+    if not chunks:
+        print("\n  ✗ No chunks produced.")
         sys.exit(1)
 
     elapsed = time.time() - start_time
-    print(f"\n  ✓ Chunking complete!")
-    print(f"    Total chunks generated : {len(all_chunks)}")
-    print(f"    Time elapsed           : {elapsed:.1f} seconds")
+    print(f"\n  ✓ {len(chunks)} chunks in {elapsed:.1f}s")
 
-    # ── STEP 5: Show chunk statistics ─────────────────────────────────────────
+    # ── Stats ─────────────────────────────────────────────────────────────────
     print_divider("STEP 5: Chunk Statistics")
-    print_language_breakdown(all_chunks)
+    type_counts = Counter(c["chunk_type"] for c in chunks)
+    lang_counts = Counter(c["language"]   for c in chunks)
 
-    # Avg chunk size
-    avg_lines = sum(c["end_line"] - c["start_line"] + 1 for c in all_chunks) / len(all_chunks)
-    avg_chars = sum(len(c["text"]) for c in all_chunks) / len(all_chunks)
-    print(f"\n  Average chunk size : {avg_lines:.1f} lines  ({avg_chars:.0f} characters)")
-    print(f"  Largest chunk      : {max(len(c['text']) for c in all_chunks)} characters")
-    print(f"  Smallest chunk     : {min(len(c['text']) for c in all_chunks)} characters")
+    print("\n  Chunk types:")
+    for t, n in type_counts.most_common():
+        print(f"    {t:<22} {n}")
+    print("\n  Languages:")
+    for l, n in lang_counts.most_common(8):
+        print(f"    {l:<22} {n}")
 
-    # ── STEP 6: Print sample chunks ───────────────────────────────────────────
-    display_count = min(SHOW_CHUNKS, len(all_chunks))
-    print_divider(f"STEP 6: First {display_count} Chunks")
-    print(f"  Showing {display_count} of {len(all_chunks)} total chunks:\n")
+    chars       = [c["char_count"]     for c in chunks]
+    tokens      = [c["token_estimate"] for c in chunks]
+    oversized   = sum(1 for t in tokens if t > 512)
+    print(f"\n  Avg size   : {sum(chars)/len(chars):.0f} chars  (~{sum(tokens)/len(tokens):.0f} tokens)")
+    print(f"  Largest    : {max(chars)} chars")
+    print(f"  Oversized  : {oversized} chunks (> 512 tokens)")
 
-    for i, chunk in enumerate(all_chunks[:display_count]):
+    # ── Sample chunks ─────────────────────────────────────────────────────────
+    n = min(SHOW_CHUNKS, len(chunks))
+    print_divider(f"STEP 6: First {n} Chunks")
+    for i, chunk in enumerate(chunks[:n]):
         print_chunk(chunk, i)
 
-    # ── WEEK 1 VALIDATION SUMMARY ─────────────────────────────────────────────
-    print_divider("WEEK 1 VALIDATION SUMMARY")
+    # ── Save ──────────────────────────────────────────────────────────────────
+    if save:
+        print_divider("STEP 7: Saving Chunks to Disk")
+        from utils.file_utils import save_jsonl, get_chunk_file_path, ensure_dir
+        path = get_chunk_file_path(owner, repo)
+        ensure_dir(os.path.dirname(path))
+        written = save_jsonl(chunks, path)
+        print(f"  ✓ Saved {written} chunks → {path}")
 
-    python_chunks  = [c for c in all_chunks if c["chunk_type"] in ("function", "class", "method")]
-    window_chunks  = [c for c in all_chunks if c["chunk_type"] == "window"]
-    has_lines      = all(c["start_line"] > 0 and c["end_line"] >= c["start_line"] for c in all_chunks)
-
+    # ── Summary ───────────────────────────────────────────────────────────────
+    print_divider("WEEK 2 VALIDATION SUMMARY")
     checks = [
-        ("✓", "Repository URL parsed correctly",          True),
-        ("✓", f"{len(files)} files fetched from GitHub",  len(files) > 0),
-        ("✓", "Binary files filtered out",                 True),  # filtering happens in ingester
-        ("✓", f"{len(python_chunks)} Python function/class chunks extracted",
-                                                            len(python_chunks) >= 0),
-        ("✓", f"{len(window_chunks)} sliding window chunks for other languages",
-                                                            True),
-        ("✓", "All chunks have valid line numbers",         has_lines),
-        ("✓", "No API key exposed in output",               True),
-        ("✓", f"Total: {len(all_chunks)} chunks ready for embedding (Week 3)",
-                                                            len(all_chunks) > 0),
+        (True, "URL parsed correctly"),
+        (len(files) > 0,  f"{len(files)} files fetched from GitHub"),
+        (True,            "Binary files filtered (SKIP_EXTENSIONS active)"),
+        (any(c["chunk_type"] in ("function","class","method") for c in chunks),
+         "Python AST chunks extracted"),
+        (any(c["chunk_type"] == "heuristic_block" for c in chunks),
+         "JS/TS heuristic chunks extracted (if JS files present)"),
+        (all(c["start_line"] >= 1 and c["end_line"] >= c["start_line"] for c in chunks),
+         "All line numbers valid"),
+        (all("char_count" in c and "token_estimate" in c for c in chunks),
+         "char_count + token_estimate on all chunks"),
+        (oversized == 0,  "No oversized chunks (all ≤ 512 tokens)"),
     ]
-
-    print()
-    for icon, label, passed in checks:
-        icon = "✓" if passed else "✗"
-        print(f"  {icon}  {label}")
+    for passed, label in checks:
+        print(f"  {'✓' if passed else '⚠'} {label}")
 
     print()
     print("=" * 70)
-    print("  WEEK 1 COMPLETE ✓")
-    print(f"  {len(all_chunks)} chunks generated from {len(files)} files")
-    print(f"  in {elapsed:.1f} seconds")
+    print(f"  WEEK 2 TEST COMPLETE")
+    print(f"  {len(chunks)} chunks from {len(files)} files in {elapsed:.1f}s")
     print()
-    print("  NEXT STEPS (Week 3):")
-    print("  1. Install: pip install chromadb sentence-transformers")
-    print("  2. Build   core/embedder.py    → generate vectors from chunk text")
-    print("  3. Build   core/vector_store.py → store vectors in ChromaDB")
-    print("  4. Test:   query ChromaDB with a natural language question")
+    print("  To save chunks permanently:")
+    print(f"    python scripts/export_chunks.py {repo_url}")
+    print()
+    print("  To validate saved chunks:")
+    jsonl_path = f"data/chunks/{collection_name}_chunks.jsonl"
+    print(f"    python scripts/validate_chunks.py {jsonl_path}")
+    print()
+    print("  To run all tests:")
+    print("    pytest tests/ -v")
     print("=" * 70)
     print()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# ENTRY POINT
-# ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print()
-        print("Usage:   python test_ingester.py <github_repo_url>")
-        print()
-        print("Examples:")
-        print("  python test_ingester.py https://github.com/tiangolo/fastapi")
-        print("  python test_ingester.py https://github.com/psf/requests")
-        print("  python test_ingester.py https://github.com/pallets/flask")
-        print()
-        sys.exit(1)
-
-    repo_url = sys.argv[1].strip()
-    run_week1_test(repo_url)
+    args = parse_args()
+    run_test(args.repo_url, args.max_files, args.save)

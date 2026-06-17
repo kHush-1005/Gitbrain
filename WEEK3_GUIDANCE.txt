@@ -1,0 +1,480 @@
+
+================================================================================
+  GitBrain — Week 3 Implementation Guidance
+  Vector Intelligence Layer: Embeddings + ChromaDB + Semantic Search
+================================================================================
+  Phase:   Week 3 — Embed Chunks → Store in ChromaDB → Semantic Search
+  Stack:   Python · sentence-transformers · ChromaDB · pathlib
+  Status:  Builds on Week 2 JSONL output
+================================================================================
+
+
+────────────────────────────────────────────────────────────────────────────────
+WHAT WEEK 3 BUILDS
+────────────────────────────────────────────────────────────────────────────────
+
+Week 1 fetched code from GitHub.
+Week 2 chunked that code and saved it as JSONL files.
+Week 3 converts those chunks into vector embeddings and stores them in
+ChromaDB so you can search the codebase with natural language.
+
+After Week 3:
+  → Ask "how does authentication work?"
+  → GitBrain returns the 5 most semantically similar code chunks
+  → Each result shows: file path, line numbers, chunk type, and a preview
+
+This is semantic search — finding code by MEANING, not by keywords.
+
+
+────────────────────────────────────────────────────────────────────────────────
+KEY CONCEPTS (EXPLAINED SIMPLY)
+────────────────────────────────────────────────────────────────────────────────
+
+WHAT IS AN EMBEDDING?
+  An embedding is a list of 384 numbers that represents the "meaning" of
+  a piece of text. The sentence-transformers model converts any text into
+  this list of numbers. Similar texts produce similar number lists.
+
+  Example:
+    "user login authentication"  → [0.12, -0.34, 0.78, ...]  (384 numbers)
+    "how does user auth work?"   → [0.11, -0.31, 0.79, ...]  (very similar)
+    "database table schema"      → [-0.55, 0.23, -0.12, ...]  (very different)
+
+WHAT IS CHROMADB?
+  ChromaDB is a local vector database. It stores:
+    - The chunk text (what the LLM will read in Week 4)
+    - The embedding vector (what gets searched)
+    - The metadata (file path, line numbers, chunk type)
+
+  When you search, ChromaDB compares your query vector against all stored
+  vectors and returns the closest matches.
+
+  All data is saved on disk in: data/chroma_db/
+  No cloud account needed. No cost. Free.
+
+WHAT IS COSINE SIMILARITY?
+  ChromaDB measures similarity using cosine distance.
+  We convert it to a score between 0.0 and 1.0:
+    1.0 = identical  (same text)
+    0.7+ = very similar (same topic)
+    0.4–0.6 = related
+    < 0.3 = probably unrelated
+
+
+────────────────────────────────────────────────────────────────────────────────
+GENERATED FILE STRUCTURE
+────────────────────────────────────────────────────────────────────────────────
+
+gitbrain/
+│
+├── core/
+│   ├── __init__.py
+│   ├── github_ingester.py      ← unchanged from Week 2
+│   ├── code_chunker.py         ← unchanged from Week 2
+│   ├── embedder.py             ← NEW: sentence-transformers wrapper
+│   └── vector_store.py         ← NEW: ChromaDB wrapper
+│
+├── utils/
+│   ├── __init__.py
+│   ├── repo_parser.py          ← unchanged from Week 1
+│   └── file_utils.py           ← unchanged from Week 2
+│
+├── data/
+│   ├── chunks/
+│   │   └── owner__repo_chunks.jsonl    ← from Week 2
+│   └── chroma_db/                      ← NEW: ChromaDB writes here
+│
+├── scripts/
+│   ├── export_chunks.py        ← unchanged from Week 2
+│   ├── validate_chunks.py      ← unchanged from Week 2
+│   ├── build_vector_index.py   ← NEW: embed + store in ChromaDB
+│   └── semantic_search.py      ← NEW: query the vector index
+│
+├── tests/
+│   ├── __init__.py
+│   ├── test_chunker.py         ← from Week 2
+│   ├── test_repo_parser.py     ← from Week 2
+│   ├── test_embedder.py        ← NEW: 25 tests for embedder
+│   └── test_vector_store.py    ← NEW: 38 tests for vector_store
+│
+├── requirements.txt            ← UPDATED: added sentence-transformers, chromadb
+├── .env.example                ← UPDATED: added EMBEDDING_MODEL, CHROMA_PERSIST_DIR
+├── .gitignore                  ← UPDATED: added data/chroma_db/
+└── WEEK3_GUIDANCE.txt          ← THIS FILE
+
+
+────────────────────────────────────────────────────────────────────────────────
+HOW TO INSTALL DEPENDENCIES
+────────────────────────────────────────────────────────────────────────────────
+
+WINDOWS:
+  cd gitbrain
+  venv\Scripts\activate
+  pip install -r requirements.txt
+
+MAC / LINUX:
+  cd gitbrain
+  source venv/bin/activate
+  pip install -r requirements.txt
+
+New in Week 3:
+  sentence-transformers==3.0.1  — generates 384-dim embeddings from text
+  chromadb==0.5.3               — local vector database
+
+NOTE ON INSTALLATION TIME:
+  sentence-transformers will also install PyTorch (~300-800 MB).
+  This is normal. It happens once. Be patient — it can take 5-10 minutes
+  on a slow connection.
+
+COMMON WINDOWS INSTALLATION ISSUES:
+  If pip install is very slow: it is downloading PyTorch. Leave it running.
+  If you see "Microsoft Visual C++ required": install the VS Build Tools first.
+  If you see disk space errors: ensure 2+ GB free space before installing.
+
+VERIFY INSTALLATION:
+  python -c "from sentence_transformers import SentenceTransformer; print('OK')"
+  python -c "import chromadb; print('OK')"
+
+
+────────────────────────────────────────────────────────────────────────────────
+FIRST-TIME MODEL DOWNLOAD
+────────────────────────────────────────────────────────────────────────────────
+
+The first time you use the embedder, it downloads the all-MiniLM-L6-v2 model
+(~22 MB) from Hugging Face. This happens automatically.
+
+  Where it's saved:
+    Windows: C:\Users\<you>\.cache\huggingface\hub\
+    Linux:   ~/.cache/huggingface/hub/
+
+  After the first download, every subsequent run uses the cached version
+  — no internet connection needed.
+
+If HuggingFace is blocked on your network:
+  Download the model manually from: https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2
+  Or use a different model with the --model flag.
+
+
+────────────────────────────────────────────────────────────────────────────────
+HOW TO RUN WEEK 3 — STEP BY STEP
+────────────────────────────────────────────────────────────────────────────────
+
+  PREREQUISITE: You need a JSONL chunk file from Week 2.
+  If you don't have one yet:
+    python scripts\export_chunks.py https://github.com/psf/requests
+
+
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │  STEP 1: Build the vector index                                          │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+  WINDOWS:
+    python scripts\build_vector_index.py data\chunks\psf__requests_chunks.jsonl
+
+  MAC/LINUX:
+    python scripts/build_vector_index.py data/chunks/psf__requests_chunks.jsonl
+
+  What it does:
+    1. Loads all chunks from the JSONL file
+    2. Downloads embedding model (first time only, ~22 MB)
+    3. Embeds all chunk texts in batches of 32
+    4. Stores chunk text + embedding + metadata in ChromaDB
+    5. Prints indexing statistics
+
+  For a large repo with 500+ chunks:
+    python scripts\build_vector_index.py data\chunks\tiangolo__fastapi_chunks.jsonl --batch-size 16
+
+  To re-index from scratch (delete old index first):
+    python scripts\build_vector_index.py data\chunks\psf__requests_chunks.jsonl --fresh
+
+  Expected output (example):
+    ======================================================================
+      GitBrain — Week 3: Build Vector Index
+    ======================================================================
+      [1/5] Setting up...
+              JSONL file   : data\chunks\psf__requests_chunks.jsonl
+              Repo name    : psf__requests
+              Collection   : psf__requests
+      [2/5] Loading chunks from JSONL...
+              ✓ Loaded 312 chunks
+      [3/5] Generating embeddings...
+              Batch size   : 32
+      [Embedder] Loading model 'all-MiniLM-L6-v2'...
+              Embedding 312 chunks...
+              ✓ Embeddings generated in 8.3s
+      [4/5] Storing in ChromaDB...
+              ✓ 312 chunks stored in 1.2s
+      [5/5] Verifying...
+              Collection 'psf__requests' contains 312 chunks
+    ======================================================================
+      ✓ VECTOR INDEX BUILD COMPLETE — 312 chunks in 11.5 seconds
+    ======================================================================
+
+
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │  STEP 2: Run semantic search                                             │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+  WINDOWS:
+    python scripts\semantic_search.py psf__requests "how are headers set?"
+    python scripts\semantic_search.py psf__requests "authentication and sessions"
+    python scripts\semantic_search.py psf__requests "how does the response object work"
+
+  MAC/LINUX:
+    python scripts/semantic_search.py psf__requests "how are headers set?"
+
+  With options:
+    Show only Python chunks:
+      python scripts\semantic_search.py psf__requests "headers" --language python
+    Show full code (not preview):
+      python scripts\semantic_search.py psf__requests "headers" --show-code
+    Get top 10 results:
+      python scripts\semantic_search.py psf__requests "headers" --top-k 10
+    Only high-confidence results:
+      python scripts\semantic_search.py psf__requests "headers" --min-score 0.5
+
+  Expected output (example):
+    ======================================================================
+      GitBrain — Semantic Search
+    ======================================================================
+      Repository : psf__requests
+      Query      : 'how are headers set?'
+      Top-K      : 5
+      Index size : 312 chunks
+
+      [1/2] Embedding query...
+              ✓ Query embedded in 45ms
+      [2/2] Searching collection 'psf__requests'...
+              ✓ Search completed in 12ms
+
+      Found 5 result(s) for: 'how are headers set?'
+
+      ┌─ Result #1 ──────────────────────────────────────────────────────
+      │  Score      : 0.7842  [████████████████░░░░]
+      │  File       : requests/models.py
+      │  Name       : PreparedRequest.prepare_headers
+      │  Type       : method  |  Language: python
+      │  Lines      : 412 – 430
+      │  Preview    : 'def prepare_headers(self, headers):...'
+      └──────────────────────────────────────────────────────────────────
+
+
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │  STEP 3: Run pytest tests                                                │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+  Note: test_embedder.py tests require the HuggingFace model download.
+        test_vector_store.py tests use fake embeddings — run offline.
+
+  Run only vector store tests (no internet needed):
+    pytest tests\test_vector_store.py -v
+
+  Run all tests including embedder (requires internet on first run):
+    pytest tests\ -v
+
+  Expected: 38 vector_store tests pass immediately.
+            25 embedder tests pass after model downloads.
+
+
+────────────────────────────────────────────────────────────────────────────────
+EXECUTION FLOW
+────────────────────────────────────────────────────────────────────────────────
+
+INDEXING FLOW (build_vector_index.py):
+
+  build_vector_index.py
+      │
+      ├── 1. Parse args (JSONL path, batch-size, fresh flag)
+      │
+      ├── 2. utils/file_utils.py → load_jsonl()
+      │         Reads data/chunks/owner__repo_chunks.jsonl
+      │         Returns list of chunk dicts
+      │
+      ├── 3. core/embedder.py → get_embedding_model()
+      │         Downloads all-MiniLM-L6-v2 (first run only)
+      │         Returns loaded SentenceTransformer model
+      │
+      ├── 4. core/embedder.py → embed_batch()
+      │         Processes chunks in batches of 32
+      │         Each chunk text → [384 floats]
+      │         Attaches embedding to each chunk dict
+      │
+      └── 5. core/vector_store.py → upsert_chunks()
+                Creates ChromaDB collection (or reuses existing)
+                Stores: text + vector + metadata per chunk
+                Saves to disk: data/chroma_db/
+
+SEARCH FLOW (semantic_search.py):
+
+  semantic_search.py
+      │
+      ├── 1. Read query from command line
+      │
+      ├── 2. core/embedder.py → embed_text()
+      │         "how does login work?"  → [384 floats]
+      │
+      └── 3. core/vector_store.py → similarity_search()
+                Sends query vector to ChromaDB
+                ChromaDB computes cosine distance vs all stored vectors
+                Returns top-K most similar chunks
+                We convert distance → similarity score (1 - distance)
+                Print results with score, file path, line range, preview
+
+
+────────────────────────────────────────────────────────────────────────────────
+WHAT EACH NEW FILE DOES
+────────────────────────────────────────────────────────────────────────────────
+
+core/embedder.py
+  Wraps the sentence-transformers library.
+  Key functions:
+    get_embedding_model()  — lazy singleton; loads model once, reuses
+    embed_text(text)       — single text → list of 384 floats
+    embed_batch(texts)     — list of texts → list of 384-float lists
+    validate_embedding(v)  — check that a vector has correct dimension/type
+
+core/vector_store.py
+  Wraps ChromaDB for storing and searching embeddings.
+  Key functions:
+    get_client(dir)                       — lazy ChromaDB client singleton
+    sanitize_collection_name(name)        — make name ChromaDB-safe
+    get_or_create_collection(name, dir)   — open or create a collection
+    upsert_chunks(chunks, name)           — store embedded chunks
+    similarity_search(vector, name, k)    — find top-k similar chunks
+    collection_count(name)                — count stored chunks
+    delete_collection(name)               — delete for re-indexing
+
+scripts/build_vector_index.py
+  Main Week 3 script. Runs: load JSONL → embed → store in ChromaDB.
+  Accepts --batch-size, --fresh, --repo-name flags.
+
+scripts/semantic_search.py
+  Query the vector index from terminal.
+  Accepts --top-k, --language, --min-score, --show-code flags.
+
+tests/test_embedder.py
+  25 pytest tests covering: dimension check, float types, determinism,
+  semantic similarity sanity, empty input error handling.
+  (Requires HuggingFace model download on first run)
+
+tests/test_vector_store.py
+  38 pytest tests covering: name sanitization, collection CRUD,
+  upsert/count/search/delete, metadata preservation, edge cases.
+  (Uses fake [0.1]*384 embeddings — no model needed — runs offline)
+
+
+────────────────────────────────────────────────────────────────────────────────
+COMMON WINDOWS ERRORS AND FIXES
+────────────────────────────────────────────────────────────────────────────────
+
+ERROR: 'venv\Scripts\activate' is not recognized
+  FIX: Make sure you are in the gitbrain\ folder.
+       Run: dir  to confirm venv\ folder exists.
+       If not: python -m venv venv  then try again.
+
+ERROR: sentence-transformers install is very slow
+  FIX: It is downloading PyTorch (~300-800 MB). This is normal.
+       Leave it running. It happens once.
+
+ERROR: ERROR: Could not find a version of torch
+  FIX: pip install torch --index-url https://download.pytorch.org/whl/cpu
+       Then: pip install sentence-transformers
+
+ERROR: OSError: [Errno 28] No space left on device
+  FIX: Free up disk space. PyTorch + model needs ~2 GB free.
+       Delete old Downloads or temporary files.
+
+ERROR: RuntimeError: Failed to load embedding model
+       "couldn't connect to 'https://huggingface.co'"
+  FIX: Check your internet connection.
+       If HuggingFace is blocked on your network:
+         - Use a VPN
+         - Or download the model on another machine and copy the cache folder
+
+ERROR: FileNotFoundError: JSONL file not found
+  FIX: Run Week 2 first:
+       python scripts\export_chunks.py https://github.com/psf/requests
+       Then run build_vector_index.py again.
+
+ERROR: Collection 'X' is empty after indexing
+  FIX: Check that the JSONL file has content:
+       python scripts\validate_chunks.py data\chunks\X_chunks.jsonl
+       If empty: re-run export_chunks.py
+
+ERROR: Wrong file path separators (/ vs \)
+  FIX: The scripts use pathlib internally and accept both / and \.
+       Both of these work on Windows:
+         python scripts\build_vector_index.py data\chunks\psf__requests_chunks.jsonl
+         python scripts\build_vector_index.py data/chunks/psf__requests_chunks.jsonl
+
+ERROR: Collection name mismatch in semantic_search.py
+  FIX: The repo name in semantic_search.py must match the collection name
+       that was created by build_vector_index.py.
+       Run: python -c "from core.vector_store import list_collections; print(list_collections())"
+       To see all available collection names.
+
+ERROR: chromadb.errors.InvalidCollectionException
+  FIX: The collection name has illegal characters.
+       The sanitize_collection_name() function handles this automatically.
+       If you passed a custom --repo-name, verify it has only a-z, 0-9, _.
+
+
+────────────────────────────────────────────────────────────────────────────────
+WEEK 3 VALIDATION CHECKLIST
+────────────────────────────────────────────────────────────────────────────────
+
+  □ pip install -r requirements.txt completes without errors
+  □ python -c "from sentence_transformers import SentenceTransformer; print('OK')"
+  □ python -c "import chromadb; print('OK')"
+  □ python core/vector_store.py  — all 6 self-tests pass
+  □ build_vector_index.py completes and prints "VECTOR INDEX BUILD COMPLETE"
+  □ data/chroma_db/ folder is created and contains files
+  □ Collection count is greater than 0 after indexing
+  □ semantic_search.py returns results with file paths and scores
+  □ Asking an auth-related question returns auth-related code chunks
+  □ pytest tests\test_vector_store.py -v  — 38 tests pass
+  □ pytest tests\test_embedder.py -v  — 25 tests pass (requires internet)
+
+
+────────────────────────────────────────────────────────────────────────────────
+WHAT NOT TO BUILD IN WEEK 3
+────────────────────────────────────────────────────────────────────────────────
+
+  ✗ DO NOT build FastAPI endpoints — that is Week 4
+  ✗ DO NOT connect to Groq or any LLM — that is Week 4
+  ✗ DO NOT build Streamlit frontend — that is Week 5
+  ✗ DO NOT add GitHub Actions — that is Week 6
+
+
+────────────────────────────────────────────────────────────────────────────────
+WEEK 4 PREVIEW
+────────────────────────────────────────────────────────────────────────────────
+
+After Week 3, GitBrain can find relevant code chunks for any natural language
+query. Week 4 connects this to an LLM to turn those chunks into answers.
+
+Week 4 builds:
+  core/llm_client.py     — wraps Groq API (Llama 3.1, free tier)
+  core/rag_engine.py     — orchestrates: embed query → retrieve → build prompt → LLM
+  api/main.py            — FastAPI with /ingest and /query endpoints
+  api/routes/ingest.py   — POST /ingest triggers ingestion + indexing
+  api/routes/query.py    — POST /query returns LLM answer + citations
+
+New packages for Week 4:
+  pip install fastapi uvicorn groq
+
+You will need a free Groq API key from: https://console.groq.com
+Add it to .env: GROQ_API_KEY=gsk_yourkey
+
+Week 4 query flow:
+  User asks: "how does authentication work?"
+  1. embed the question (embedder.py)
+  2. retrieve top-5 chunks (vector_store.py)  ← BUILT IN WEEK 3
+  3. build a prompt with the chunks + question (rag_engine.py)
+  4. send prompt to Llama 3.1 via Groq (llm_client.py)
+  5. return answer + source citations (FastAPI /query endpoint)
+
+================================================================================
+  END OF WEEK 3 GUIDANCE
+  Build index → Search → Verify → Move to Week 4.
+================================================================================

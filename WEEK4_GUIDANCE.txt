@@ -1,0 +1,518 @@
+
+================================================================================
+  GitBrain — Week 4 Implementation Guidance
+  Backend Intelligence Layer: FastAPI + RAG Engine + Groq/Llama 3
+================================================================================
+  Phase:   Week 4 — FastAPI Backend + LLM Integration + RAG Pipeline
+  Stack:   FastAPI · Groq · Llama 3 · Pydantic · sentence-transformers · ChromaDB
+  Status:  Builds on Week 3 vector index
+================================================================================
+
+
+────────────────────────────────────────────────────────────────────────────────
+WHAT WEEK 4 ADDS (compared to Week 3)
+────────────────────────────────────────────────────────────────────────────────
+
+Week 3 ended with semantic search working in the terminal.
+You could run a script and see "here are the top 5 most similar code chunks."
+
+Week 4 connects those chunks to an LLM and wraps everything in a proper API.
+
+NEW IN WEEK 4:
+  config/settings.py     — Central config via Pydantic BaseSettings
+  core/llm_client.py     — Groq API wrapper (Llama 3, with retry logic)
+  core/rag_engine.py     — RAG pipeline: embed → retrieve → filter → prompt → LLM → cite
+  api/main.py            — FastAPI application with CORS and startup logging
+  api/routes/health.py   — GET /health endpoint
+  api/routes/query.py    — POST /query endpoint (the main endpoint)
+  tests/test_api.py      — 22 FastAPI tests (all offline, no API key needed)
+
+UPDATED IN WEEK 4:
+  requirements.txt       — added fastapi, uvicorn, groq, pydantic-settings, httpx
+  .env.example           — added GROQ_API_KEY, LLM_MODEL, TOP_K_RESULTS, SIMILARITY_THRESHOLD
+
+
+────────────────────────────────────────────────────────────────────────────────
+BACKEND ARCHITECTURE
+────────────────────────────────────────────────────────────────────────────────
+
+The backend follows a clean layered architecture:
+
+  HTTP Layer      →  api/main.py, api/routes/
+  Config Layer    →  config/settings.py
+  RAG Layer       →  core/rag_engine.py
+  LLM Layer       →  core/llm_client.py
+  Retrieval Layer →  core/embedder.py, core/vector_store.py
+  Data Layer      →  data/chroma_db/ (ChromaDB index)
+
+Each layer only talks to the layer below it. This means:
+  - You can test each layer independently
+  - You can swap out the LLM (e.g. change from Groq to OpenAI) without touching the API
+  - You can swap ChromaDB for Pinecone without touching the RAG engine
+
+
+────────────────────────────────────────────────────────────────────────────────
+API DESIGN
+────────────────────────────────────────────────────────────────────────────────
+
+The FastAPI app exposes two endpoints:
+
+  GET  /health   — Verify the server is running and check config status
+  POST /query    — Ask a question, get a cited AI answer
+
+Why FastAPI?
+  - Automatic request validation via Pydantic models
+  - Auto-generated Swagger UI at /docs (interactive — try the API right in browser)
+  - Async support for future streaming responses (Week 5+)
+  - Type hints make the code self-documenting
+
+REQUEST FORMAT for POST /query:
+  {
+    "question":  "how does user authentication work?",   ← required
+    "repo_name": "psf__requests",                       ← required, must match indexed collection
+    "top_k":     5                                       ← optional, 1-20, default from .env
+  }
+
+RESPONSE FORMAT:
+  {
+    "answer":           "Authentication is handled by HTTPBasicAuth... [FILE: ...]",
+    "sources":          [{"file": "...", "lines": "1-50", "score": 0.89}],
+    "chunks_retrieved": 3,
+    "repo_name":        "psf__requests"
+  }
+
+ERROR RESPONSES:
+  422 — Invalid request (Pydantic handles this automatically)
+  400 — Empty question string
+  404 — Repository not indexed (run build_vector_index.py first)
+  503 — GROQ_API_KEY missing
+  500 — Unexpected server error
+
+
+────────────────────────────────────────────────────────────────────────────────
+RAG FLOW (STEP BY STEP)
+────────────────────────────────────────────────────────────────────────────────
+
+When you call POST /query, this is exactly what happens:
+
+  1. FastAPI receives request
+     → Pydantic validates: question not empty, repo_name not empty, top_k in range
+
+  2. api/routes/query.py calls rag_engine.answer_question()
+
+  3. rag_engine checks prerequisites:
+     → Is GROQ_API_KEY set? If not → 503 error
+     → Does the ChromaDB collection exist? If not → 404 error
+
+  4. embedder.embed_text(question)
+     → "how does authentication work?" → [0.12, -0.34, ...] (384 floats)
+     → Uses the same model that was used to index the chunks
+       (MUST be the same model — different models = different vector spaces)
+
+  5. vector_store.similarity_search(query_vector, repo_name, top_k)
+     → ChromaDB computes cosine distance between query vector and all stored vectors
+     → Returns top-k most similar chunks with scores
+
+  6. Threshold filtering
+     → Remove any chunk with score < SIMILARITY_THRESHOLD (default 0.35)
+     → If nothing passes: return "I could not find relevant information" directly
+       (No LLM call! This saves Groq API quota)
+
+  7. rag_engine.build_prompt(question, filtered_chunks)
+     → Combines SYSTEM_PROMPT + code chunks with file/line metadata + question
+
+  8. llm_client.generate(prompt)
+     → Sends prompt to Groq API
+     → Groq runs Llama 3 inference (very fast — ~1-3 seconds)
+     → Returns generated text
+
+  9. rag_engine.parse_citations(llm_output, chunks)
+     → Regex extracts all [FILE: path, Lines X-Y] markers
+     → Falls back to raw chunk metadata if LLM didn't cite
+
+  10. Return JSON response
+
+
+────────────────────────────────────────────────────────────────────────────────
+GROQ INTEGRATION
+────────────────────────────────────────────────────────────────────────────────
+
+Groq is a free LLM inference API that runs Llama 3.
+
+WHY GROQ (not OpenAI, not Ollama)?
+  - Free tier — no credit card needed for development
+  - Extremely fast — 200-800 tokens/second (much faster than local Ollama)
+  - Llama 3 quality is excellent for code explanation tasks
+  - Simple Python SDK
+
+HOW TO GET YOUR FREE KEY:
+  1. Go to: console.groq.com
+  2. Sign up with Google or email (free, no credit card)
+  3. Click "API Keys" in the left sidebar
+  4. Click "Create API Key"
+  5. Copy the key (starts with gsk_)
+  6. Open your .env file and add: GROQ_API_KEY=gsk_yourkey
+
+MODELS AVAILABLE (all free):
+  llama3-8b-8192      — Fast, good quality. Recommended for development.
+  llama3-70b-8192     — Higher quality, slightly slower. Use for demos.
+  llama-3.1-8b-instant — Fastest option.
+
+RETRY LOGIC:
+  The llm_client wraps every Groq call with up to 3 attempts:
+  - Attempt 1: immediate
+  - Attempt 2: wait 2 seconds (exponential backoff)
+  - Attempt 3: wait 4 seconds
+  This handles temporary rate limits and network hiccups gracefully.
+
+TEMPERATURE = 0.1:
+  We use a very low temperature (0.1 instead of the default 0.7).
+  Low temperature = the LLM is more "focused" and less "creative."
+  This reduces hallucination for factual code explanation tasks.
+
+
+────────────────────────────────────────────────────────────────────────────────
+HOW config/settings.py WORKS
+────────────────────────────────────────────────────────────────────────────────
+
+settings.py uses Pydantic BaseSettings to load configuration from .env.
+
+  from config.settings import settings
+
+  print(settings.groq_api_key)      # reads GROQ_API_KEY from .env
+  print(settings.top_k_results)     # reads TOP_K_RESULTS, returns int
+  print(settings.similarity_threshold)  # returns float
+
+Why use this instead of os.getenv() everywhere?
+  - Type validation: TOP_K_RESULTS=abc will raise a clear error at startup
+  - Default values: no need for os.getenv("X", "default") scattered everywhere
+  - Single source of truth: change a setting in one place
+
+IMPORTANT: Every module must import from config.settings, not os.environ directly.
+  CORRECT:   from config.settings import settings; key = settings.groq_api_key
+  WRONG:     key = os.getenv("GROQ_API_KEY")  ← scattered, hard to test
+
+
+────────────────────────────────────────────────────────────────────────────────
+FILE EXPLANATIONS
+────────────────────────────────────────────────────────────────────────────────
+
+config/settings.py
+  Reads all environment variables from .env using Pydantic BaseSettings.
+  Provides typed access to: GROQ_API_KEY, EMBEDDING_MODEL, CHROMA_PERSIST_DIR,
+  LLM_MODEL, TOP_K_RESULTS, SIMILARITY_THRESHOLD, GITHUB_TOKEN.
+  Also provides helper functions: require_groq_key(), require_chroma_index().
+
+core/llm_client.py
+  Wraps the Groq SDK. Exposes:
+    generate(prompt)              — send one prompt string, get one response
+    generate_with_messages(msgs)  — send a full message list (multi-turn)
+  Handles retry with exponential backoff. Lazy-loads the Groq client on first call.
+
+core/rag_engine.py
+  The brain of the system. Contains:
+    answer_question(question, repo_name, top_k, threshold)
+      — Main entry point called by the API route
+      — Orchestrates: embed → retrieve → filter → prompt → LLM → cite
+    build_prompt(question, chunks)
+      — Assembles the system prompt + code context + user question
+    parse_citations(llm_output, chunks)
+      — Regex-extracts [FILE: ...] markers from LLM response
+      — Falls back to raw chunk metadata if LLM omitted citations
+
+api/main.py
+  Creates the FastAPI app. Registers routes. Configures CORS.
+  Prints startup information (model, keys, settings).
+  Can be run directly: python api/main.py
+  Or via uvicorn: uvicorn api.main:app --reload --port 8000
+
+api/routes/health.py
+  Simple GET /health endpoint. Returns JSON with API status.
+  Also checks: is Groq key configured? Where is ChromaDB?
+  Used for: confirming startup worked, monitoring in production.
+
+api/routes/query.py
+  POST /query endpoint. The main endpoint.
+  Defines QueryRequest and QueryResponse Pydantic models (with examples).
+  Calls rag_engine.answer_question() and returns the result as JSON.
+  Maps RuntimeError → appropriate HTTP status codes.
+
+tests/test_api.py
+  22 pytest tests covering:
+    - Health endpoint structure
+    - Query request validation (missing fields, empty strings, bad top_k)
+    - Query response structure (mocked RAG engine — no real API key needed)
+    - Error handling (404 for unindexed repo, 503 for missing key)
+    - Swagger/docs accessibility
+
+
+────────────────────────────────────────────────────────────────────────────────
+HOW TO RUN WEEK 4 — STEP BY STEP (WINDOWS)
+────────────────────────────────────────────────────────────────────────────────
+
+STEP 0: Prerequisites from previous weeks
+
+  Make sure you have a JSONL chunk file and a ChromaDB index.
+  If not, run:
+    venv\Scripts\activate
+    python scripts\export_chunks.py https://github.com/psf/requests
+    python scripts\build_vector_index.py data\chunks\psf__requests_chunks.jsonl
+
+
+STEP 1: Install new Week 4 dependencies
+
+  venv\Scripts\activate
+  pip install -r requirements.txt
+
+  New packages being installed:
+    fastapi          — web framework
+    uvicorn[standard] — ASGI server to run FastAPI
+    groq             — Groq SDK for Llama 3
+    pydantic-settings — settings management
+    httpx            — async HTTP client (used by FastAPI TestClient)
+
+
+STEP 2: Configure your .env file
+
+  copy .env.example .env
+
+  Open .env in Notepad and add your Groq key:
+    GROQ_API_KEY=gsk_yourkeyhere
+
+  Get a free key at: console.groq.com → API Keys → Create API Key
+
+
+STEP 3: Verify settings loaded
+
+  python config\settings.py
+
+  Expected output:
+    GitBrain Configuration
+    ────────────────────────────────────────
+      LLM Model            : llama3-8b-8192
+      Embedding Model      : all-MiniLM-L6-v2
+      ChromaDB Dir         : data/chroma_db
+      Groq Key             : ✓ set
+
+
+STEP 4: Start the FastAPI server
+
+  uvicorn api.main:app --reload --port 8000
+
+  You should see:
+    INFO  | GitBrain API starting...
+    INFO  |   LLM Model  : llama3-8b-8192
+    INFO  |   Groq Key   : ✓ configured
+    INFO  | Docs: http://127.0.0.1:8000/docs
+    INFO  | Uvicorn running on http://127.0.0.1:8000
+
+
+STEP 5: Test the health endpoint
+
+  In your browser:  http://127.0.0.1:8000/health
+  
+  Or in a new terminal (with venv activated):
+    curl http://127.0.0.1:8000/health
+
+  Expected response:
+    {"status":"ok","service":"GitBrain API","groq_key":"configured","chroma":"data/chroma_db"}
+
+
+STEP 6: Open Swagger UI
+
+  In your browser: http://127.0.0.1:8000/docs
+
+  The Swagger UI lets you test the API interactively.
+  Click "POST /query" → "Try it out" → fill in the form → "Execute"
+
+
+STEP 7: Make your first query (curl)
+
+  Windows Command Prompt:
+    curl -X POST http://127.0.0.1:8000/query ^
+      -H "Content-Type: application/json" ^
+      -d "{\"question\":\"how does authentication work?\",\"repo_name\":\"psf__requests\"}"
+
+  Windows PowerShell:
+    Invoke-RestMethod -Uri "http://127.0.0.1:8000/query" `
+      -Method POST `
+      -ContentType "application/json" `
+      -Body '{"question":"how does authentication work?","repo_name":"psf__requests"}'
+
+  Expected response:
+    {
+      "answer": "Authentication in this repository is handled by the HTTPBasicAuth...",
+      "sources": [{"file": "requests/auth.py", "lines": "1-50", "score": 0.89}],
+      "chunks_retrieved": 3,
+      "repo_name": "psf__requests"
+    }
+
+
+STEP 8: Run all tests
+
+  pytest tests\ -v
+
+  Expected: All tests in test_api.py, test_chunker.py, test_repo_parser.py,
+            test_vector_store.py pass immediately (no internet needed).
+            test_embedder.py passes after first model download.
+
+
+────────────────────────────────────────────────────────────────────────────────
+TESTING INSTRUCTIONS
+────────────────────────────────────────────────────────────────────────────────
+
+OFFLINE TESTS (no API key, no internet needed):
+
+  pytest tests\test_api.py -v           ← 22 API tests (mocked)
+  pytest tests\test_chunker.py -v       ← 9 chunking tests
+  pytest tests\test_repo_parser.py -v   ← 8 URL parsing tests
+  pytest tests\test_vector_store.py -v  ← 14 ChromaDB tests
+
+TESTS REQUIRING INTERNET (first run only — model downloads):
+
+  pytest tests\test_embedder.py -v      ← 13 embedding tests
+
+RUN ALL AT ONCE:
+  pytest tests\ -v
+
+
+────────────────────────────────────────────────────────────────────────────────
+VALIDATION CHECKLIST
+────────────────────────────────────────────────────────────────────────────────
+
+Complete this checklist before moving to Week 5:
+
+  □ pip install -r requirements.txt completes without errors
+  □ .env file exists with GROQ_API_KEY set
+  □ python config\settings.py prints "✓ set" for Groq Key
+  □ data/chroma_db/ folder exists (from Week 3)
+  □ uvicorn api.main:app --reload --port 8000 starts without errors
+  □ http://127.0.0.1:8000/health returns {"status":"ok"}
+  □ http://127.0.0.1:8000/docs opens in browser (Swagger UI visible)
+  □ POST /query with a valid question returns answer + sources JSON
+  □ POST /query with unknown repo returns HTTP 404
+  □ POST /query with empty question returns HTTP 422
+  □ A question unrelated to the codebase returns "could not find" fallback
+  □ pytest tests\ -v shows all offline tests passing
+
+
+────────────────────────────────────────────────────────────────────────────────
+COMMON WINDOWS ERRORS AND FIXES
+────────────────────────────────────────────────────────────────────────────────
+
+ERROR: 'uvicorn' is not recognized as an internal or external command
+  FIX: Your virtual environment is not activated.
+       Run: venv\Scripts\activate
+       Then try uvicorn again.
+
+ERROR: ModuleNotFoundError: No module named 'fastapi'
+  FIX: pip install -r requirements.txt
+       Make sure venv is activated first.
+
+ERROR: .env is not loading / settings show empty values
+  FIX: The .env file must be in the project root (gitbrain/ folder).
+       Check: dir .env   (Windows)  — should show the file
+       Check: type .env  — should show your variables
+
+ERROR: GROQ_API_KEY is not set (503 from /query)
+  FIX: Open .env and add: GROQ_API_KEY=gsk_yourkey
+       Save the file. Stop uvicorn (Ctrl+C). Restart it.
+       The --reload flag should pick up the change automatically.
+
+ERROR: Collection 'X' is empty or doesn't exist (404 from /query)
+  FIX: The repo_name in your request must match what was indexed.
+       Check indexed collections:
+         python -c "from core.vector_store import list_collections; print(list_collections())"
+       Re-index if needed:
+         python scripts\build_vector_index.py data\chunks\YOUR_REPO_chunks.jsonl
+
+ERROR: repo_name mismatch (you used "psf/requests" instead of "psf__requests")
+  FIX: Always use double underscore: owner__repo (no slash, no hyphen)
+       Example: psf__requests, tiangolo__fastapi, pallets__flask
+       The repo name is printed by build_vector_index.py when it finishes.
+
+ERROR: curl command not working on Windows CMD
+  FIX 1: Use ^ for line continuation in CMD
+  FIX 2: Use PowerShell: Invoke-RestMethod (see run instructions above)
+  FIX 3: Use the Swagger UI at http://127.0.0.1:8000/docs instead
+
+ERROR: Address already in use (port 8000 taken)
+  FIX: Use a different port: uvicorn api.main:app --reload --port 8001
+       Or find and kill the process using port 8000:
+         netstat -ano | findstr :8000
+         taskkill /PID <PID> /F
+
+ERROR: Slow first request (5-15 seconds)
+  FIX: This is normal! The first request downloads and loads the embedding model
+       (~22 MB). All subsequent requests are fast (under 3 seconds).
+
+ERROR: ChromaDB permission error on Windows
+  FIX: Make sure no other process has the data\chroma_db\ folder open.
+       Close any file explorer windows pointing to it.
+       Restart VS Code if it's indexing the folder.
+
+ERROR: groq.AuthenticationError: Invalid API Key
+  FIX: Your GROQ_API_KEY is wrong or expired.
+       Generate a new one at console.groq.com → API Keys.
+       Update .env and restart the server.
+
+ERROR: groq.RateLimitError
+  FIX: You've hit Groq's free tier rate limit.
+       Wait 60 seconds and try again.
+       Or switch to a smaller model: LLM_MODEL=llama-3.1-8b-instant in .env
+
+
+────────────────────────────────────────────────────────────────────────────────
+HOW WEEK 5 STREAMLIT FRONTEND WILL CONNECT
+────────────────────────────────────────────────────────────────────────────────
+
+Week 5 will add a Streamlit browser interface that talks to this FastAPI backend.
+
+The CORS middleware added in api/main.py (allow_origins=["*"]) already allows
+the frontend to call the API from a browser. No changes needed to the backend.
+
+Week 5 frontend will work like this:
+
+  1. User opens the Streamlit app in a browser
+  2. Sidebar: enter a GitHub repo URL → trigger ingestion via POST /ingest
+     (Week 5 will also add a POST /ingest endpoint to trigger indexing via API)
+  3. Chat input: user types a question
+  4. Frontend calls POST /query with the question and repo_name
+  5. Frontend displays the answer in a chat bubble
+  6. Frontend shows sources in a collapsible expander below the answer
+
+The frontend only needs to make HTTP POST requests to this API.
+It does not import any Python modules from core/ — it is completely decoupled.
+
+FRONTEND ENVIRONMENT:
+  BACKEND_URL = http://127.0.0.1:8000  (local development)
+  or
+  BACKEND_URL = https://your-railway-app.railway.app  (deployed)
+
+WEEK 5 NEW FILES:
+  frontend/app.py          — Streamlit UI
+  frontend/api_client.py   — HTTP helper for calling FastAPI
+
+
+────────────────────────────────────────────────────────────────────────────────
+WEEK 4 COMPLETE SUMMARY
+────────────────────────────────────────────────────────────────────────────────
+
+After completing Week 4, GitBrain has:
+
+  ✓ A running FastAPI backend at http://127.0.0.1:8000
+  ✓ GET /health — confirms service is running
+  ✓ POST /query — takes a question, returns a cited AI answer
+  ✓ Interactive Swagger UI at /docs
+  ✓ Full RAG pipeline: embed → retrieve → filter → prompt → LLM → cite
+  ✓ Groq/Llama 3 integration with retry and error handling
+  ✓ Pydantic settings management (single .env file)
+  ✓ 22 offline API tests passing
+  ✓ Graceful fallback when no relevant context found
+  ✓ Hallucination prevention via grounding prompt + threshold filtering
+  ✓ CORS configured for Week 5 Streamlit frontend
+
+================================================================================
+  END OF WEEK 4 GUIDANCE
+  Start API → Test endpoints → Validate → Move to Week 5 (Streamlit Frontend)
+================================================================================

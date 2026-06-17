@@ -1,0 +1,313 @@
+
+================================================================================
+  GitBrain — Week 5 Implementation Guidance
+  React + Vite + Tailwind CSS Frontend
+================================================================================
+  Phase:   Week 5 — React Frontend connected to FastAPI Backend
+  Stack:   React 18 · Vite 5 · Tailwind CSS 3 · Axios · Lucide React
+  Status:  Builds on Week 4 FastAPI backend
+================================================================================
+
+
+────────────────────────────────────────────────────────────────────────────────
+WHY REACT INSTEAD OF STREAMLIT
+────────────────────────────────────────────────────────────────────────────────
+
+Streamlit is great for quick Python data dashboards, but has limitations:
+  - No real-time interaction without workarounds
+  - Difficult to style to look like a professional product
+  - Re-renders the entire app on every interaction
+  - Harder to maintain as a standalone frontend
+
+React + Vite + Tailwind CSS gives you:
+  ✓ A proper component architecture (reusable, testable pieces)
+  ✓ Instant feedback with controlled inputs (no full-page rerenders)
+  ✓ Professional UI that looks like Claude/ChatGPT/Cursor
+  ✓ Auto-scroll, animations, collapsible panels — all easy in React
+  ✓ A real-world skill that employers actually want
+
+
+────────────────────────────────────────────────────────────────────────────────
+FRONTEND ARCHITECTURE
+────────────────────────────────────────────────────────────────────────────────
+
+The frontend is 100% decoupled from the Python backend.
+It communicates ONLY through HTTP API calls to FastAPI.
+
+  React Component Tree:
+
+    App.jsx                    ← root: state, health polling, send logic
+    ├── Sidebar.jsx            ← branding, status cards, repo info
+    │   └── StatusCard.jsx     ← reusable coloured status badge
+    └── main content
+        ├── RepoSetup.jsx      ← URL input, ingest button, error feedback
+        └── ChatWindow.jsx     ← message list, input bar, clear button
+            ├── ChatMessage.jsx ← single message bubble (user or AI)
+            │   └── SourcePanel.jsx ← collapsible source citations
+            └── LoadingDots.jsx ← animated three-dot spinner
+
+  Service Layer:
+
+    src/services/apiClient.js  ← all HTTP calls (Axios)
+      healthCheck()
+      queryRepository()
+      ingestRepository()
+      getBackendStatus()
+
+  Utilities:
+
+    src/utils/repoUtils.js     ← URL → collection name conversion, score formatting
+
+
+────────────────────────────────────────────────────────────────────────────────
+API COMMUNICATION FLOW
+────────────────────────────────────────────────────────────────────────────────
+
+  HEALTH CHECK (every 15 seconds):
+    App.jsx → getBackendStatus() → GET /health
+    → updates backendStatus state → Sidebar re-renders status cards
+
+  REPOSITORY INGESTION:
+    User enters URL → clicks "Index Repository"
+    RepoSetup.jsx → ingestRepository(url, token) → POST /ingest
+    On success: App.jsx sets currentRepo, clears chat history
+    On 404 (endpoint not yet added): shows terminal commands
+
+  CHAT QUERY:
+    User types question → hits Enter or Send
+    ChatWindow.jsx → onSend() → App.jsx.handleSend()
+    → queryRepository(question, repoName) → POST /query
+    → appends assistant message with answer + sources
+    → ChatMessage.jsx renders answer; SourcePanel.jsx renders citations
+
+
+────────────────────────────────────────────────────────────────────────────────
+STATE MANAGEMENT
+────────────────────────────────────────────────────────────────────────────────
+
+All state lives in App.jsx using React's useState hook.
+No Redux, no Zustand — the project scope doesn't need them.
+
+  backendStatus  { online, groqConfigured, chromaDir, error }
+    Updated every 15 seconds by the health poll interval.
+
+  currentRepo    string | null
+    Set when a repository is successfully indexed or manually selected.
+    Cleared when the user clicks "Change repo".
+
+  repoUrl        string | null
+    The original GitHub URL (displayed in the sidebar "View on GitHub" link).
+
+  messages       Array<{role, content, sources, timestamp, isError}>
+    The full chat history. Each call to handleSend appends a user message
+    immediately (optimistic update), then appends the assistant message
+    when the API responds.
+
+  isLoading      boolean
+    True while waiting for the POST /query response.
+    Disables the input and shows LoadingDots.
+
+
+────────────────────────────────────────────────────────────────────────────────
+CITATION RENDERING
+────────────────────────────────────────────────────────────────────────────────
+
+Each assistant message carries a `sources` array:
+  [{ file: "requests/auth.py", lines: "1-50", score: 0.89 }, ...]
+
+This is rendered by SourcePanel.jsx as a collapsible panel below the answer.
+Clicking the panel toggles open/closed.
+Each citation shows:
+  - Numbered badge (1, 2, 3...)
+  - File path in monospace blue text
+  - Line range ("Lines 1-50")
+  - Similarity score badge (green ≥0.75, blue ≥0.5, gray otherwise)
+
+The score colour is computed by scoreColour() in repoUtils.js.
+
+
+────────────────────────────────────────────────────────────────────────────────
+HOW TO RUN ON WINDOWS
+────────────────────────────────────────────────────────────────────────────────
+
+YOU NEED TWO TERMINALS OPEN AT THE SAME TIME.
+
+TERMINAL 1 — FastAPI Backend:
+  cd gitbrain
+  venv\Scripts\activate
+  uvicorn api.main:app --reload --port 8000
+
+TERMINAL 2 — React Frontend:
+  cd gitbrain\frontend
+  npm install
+  copy .env.example .env
+  npm run dev
+
+Then open: http://localhost:5173
+
+STEP-BY-STEP:
+  1. Start Terminal 1 first. Wait for:
+       INFO  | Uvicorn running on http://127.0.0.1:8000
+  2. Start Terminal 2. Wait for:
+       VITE v5.x  ready in XXXms
+       Local: http://localhost:5173/
+  3. Open http://localhost:5173 in your browser
+  4. The sidebar should show "FastAPI Server ✓" in green
+  5. Enter a GitHub URL and click "Index Repository"
+  6. Once indexed, type a question in the chat box
+
+
+────────────────────────────────────────────────────────────────────────────────
+HOW CHAT FLOW WORKS
+────────────────────────────────────────────────────────────────────────────────
+
+1. User types question in ChatWindow input
+2. User presses Enter (or clicks Send button)
+3. ChatWindow calls onSend(question) prop
+4. App.jsx.handleSend(question) runs:
+   a. Adds user message to messages state (appears immediately)
+   b. Sets isLoading = true (shows LoadingDots)
+   c. Calls queryRepository(question, currentRepo)
+   d. Waits for FastAPI response (~1-5 seconds for Groq)
+   e. Adds assistant message to messages state
+   f. Sets isLoading = false
+5. ChatMessage renders the answer with inline code formatting
+6. SourcePanel renders citations below the answer (collapsed by default)
+7. Chat auto-scrolls to the latest message
+
+
+────────────────────────────────────────────────────────────────────────────────
+ERROR HANDLING
+────────────────────────────────────────────────────────────────────────────────
+
+Network Errors:
+  apiClient.js interceptor converts "ECONNREFUSED" to a readable message.
+  App.jsx catches errors and adds an isError=true assistant message.
+  ChatMessage.jsx renders error messages in a red bubble.
+
+Backend Errors:
+  404 → "Repository not indexed" — user sees red message + terminal instructions
+  503 → "GROQ_API_KEY missing"  — user sees red message + .env instructions
+  422 → "Invalid input"          — prevented by React input validation
+  500 → "Server error"           — shown as red message in chat
+
+Frontend Errors:
+  Invalid GitHub URL → RepoSetup shows inline validation message
+  Empty question    → Send button is disabled (no API call made)
+  No repo selected  → Input is disabled with placeholder text
+
+
+────────────────────────────────────────────────────────────────────────────────
+TESTING
+────────────────────────────────────────────────────────────────────────────────
+
+Backend API tests (tests/test_frontend_api.py):
+  Tests verify the FastAPI endpoints return the exact shape that
+  apiClient.js expects. No real Groq key needed — RAG engine is mocked.
+
+Run:
+  cd gitbrain
+  venv\Scripts\activate
+  pytest tests\test_frontend_api.py -v
+
+Expected: 28 tests, all passing
+
+Note: React component tests (e.g. with Vitest + React Testing Library) are
+Phase 2 scope. For Week 5, the backend API tests provide the safety net.
+
+
+────────────────────────────────────────────────────────────────────────────────
+VALIDATION CHECKLIST
+────────────────────────────────────────────────────────────────────────────────
+
+  □ npm install completes without errors
+  □ npm run dev starts Vite at http://localhost:5173
+  □ Backend is running at http://127.0.0.1:8000 (Terminal 1)
+  □ Sidebar shows "FastAPI Server ✓" in green
+  □ Groq status shows "configured" (add GROQ_API_KEY to backend .env)
+  □ Entering a GitHub URL enables the "Index Repository" button
+  □ Ingesting a repo (or setting manually) enables the chat input
+  □ Asking a question displays the answer in the chat
+  □ Source citations appear in a collapsible panel below the answer
+  □ Asking an off-topic question shows "I could not find..." gracefully
+  □ Network error shows a readable red error bubble (not a crash)
+  □ pytest tests\test_frontend_api.py -v shows 28 tests passing
+
+
+────────────────────────────────────────────────────────────────────────────────
+COMMON WINDOWS ERRORS AND FIXES
+────────────────────────────────────────────────────────────────────────────────
+
+ERROR: 'npm' is not recognized
+  FIX: Node.js is not installed.
+       Download from: https://nodejs.org (use the LTS version)
+       After installing, restart your terminal and try again.
+
+ERROR: npm install fails with EACCES or permission error
+  FIX: Run Command Prompt as Administrator.
+       Or: Set npm prefix to a user-owned directory.
+
+ERROR: Vite not starting / port 5173 in use
+  FIX: npm run dev -- --port 5174  (use a different port)
+       Or: taskkill /F /IM node.exe  (kill all Node processes)
+
+ERROR: http://localhost:5173 shows blank page
+  FIX: Open browser DevTools (F12) → Console tab.
+       If you see "Cannot GET /", the Vite dev server is not running.
+       If you see "Network Error", the FastAPI backend is not running.
+
+ERROR: Sidebar shows "FastAPI Server ✗" red
+  FIX: Start the backend in Terminal 1:
+       cd gitbrain && venv\Scripts\activate
+       uvicorn api.main:app --reload --port 8000
+
+ERROR: CORS error in browser console (blocked by CORS policy)
+  FIX: The vite.config.js proxy should handle this in development.
+       If you see CORS errors, check that VITE_API_BASE_URL in frontend/.env
+       matches the backend URL exactly (including port).
+       Restart both the backend and the Vite dev server.
+
+ERROR: VITE_API_BASE_URL is not working
+  FIX: Vite only loads .env files when the file is in the frontend/ folder.
+       Make sure frontend/.env exists (copy from frontend/.env.example).
+       Environment variables must start with VITE_ to be accessible in React.
+       Restart npm run dev after changing .env.
+
+ERROR: "Cannot find module 'axios'" / import errors
+  FIX: Run npm install inside the frontend/ folder (not the root gitbrain/ folder):
+       cd gitbrain\frontend && npm install
+
+ERROR: White screen with "TypeError: X is not a function"
+  FIX: Open browser DevTools (F12) → Console.
+       The error message will identify exactly which component failed.
+       Usually caused by a missing prop or undefined variable.
+
+ERROR: Citations not showing
+  FIX: The sources array may be empty if the answer was the fallback message.
+       Check that the repository is properly indexed (chunks_retrieved > 0).
+
+ERROR: npm run build fails
+  FIX: This is for production builds — not needed for development.
+       Use npm run dev for local development.
+
+
+────────────────────────────────────────────────────────────────────────────────
+WEEK 6 PREPARATION
+────────────────────────────────────────────────────────────────────────────────
+
+Week 6 adds GitHub Actions automation:
+  - POST /ingest endpoint in FastAPI (so the frontend can trigger indexing via API)
+  - GitHub Actions workflow that calls /ingest on pull request merge
+  - The "Index Repository" button in RepoSetup.jsx will fully work end-to-end
+
+Current state: The "Index Repository" button calls POST /ingest.
+If the endpoint returns 404 (not yet implemented), RepoSetup.jsx shows
+the manual terminal commands instead — a clean graceful fallback.
+
+No changes to the React frontend are needed for Week 6. The POST /ingest
+endpoint just needs to be added to the FastAPI backend.
+
+================================================================================
+  END OF WEEK 5 GUIDANCE
+  Run backend → Run frontend → Open browser → Chat!
+================================================================================

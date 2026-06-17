@@ -1,0 +1,12 @@
+{
+  "owner": "pallets",
+  "repo": "flask",
+  "total_files": 227,
+  "fetched": 223,
+  "empty": 4,
+  "failed": 0,
+  "repo_name": "pallets__flask",
+  "total_chunks": 1642,
+  "output_file": "data\\chunks\\pallets__flask_chunks.jsonl",
+  "elapsed_seconds": 155.3
+}

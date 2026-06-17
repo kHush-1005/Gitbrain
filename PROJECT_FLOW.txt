@@ -1,0 +1,84 @@
+
+================================================================================
+  GitBrain — Complete Project Flow Documentation (Weeks 1-5)
+================================================================================
+
+HIGH-LEVEL FLOW
+───────────────
+
+  User (browser at localhost:5173)
+          │ Enter GitHub URL → click Index Repository
+          ▼
+  React Frontend (frontend/src)
+          │ POST /ingest OR terminal command
+          ▼
+  INGESTION PIPELINE (one-time per repo)
+    GitHub REST API → fetch files → code_chunker.py → JSONL
+    embedder.py → 384-dim vectors → ChromaDB (data/chroma_db/)
+          │
+          │ User types question in chat
+          ▼
+  React Frontend → axios POST /query
+          ▼
+  FastAPI → RAG Engine
+    embed question → ChromaDB search → threshold filter
+    build prompt → Groq Llama 3 → parse citations
+          ▼
+  JSON response: { answer, sources, chunks_retrieved, repo_name }
+          ▼
+  React: ChatMessage + SourcePanel render answer + citations
+
+
+DETAILED REACT → FASTAPI FLOW
+──────────────────────────────
+
+  ChatWindow.jsx → onSend(question)
+  App.jsx.handleSend() → adds user message → isLoading=true
+  apiClient.js → queryRepository() → axios POST /query
+  FastAPI query.py → Pydantic validation → rag_engine.answer_question()
+  rag_engine → embed_text() → similarity_search() → filter → build_prompt()
+  llm_client → Groq API → Llama 3 → parse_citations()
+  FastAPI returns { answer, sources, chunks_retrieved, repo_name }
+  App.jsx → appends assistant message → isLoading=false
+  ChatMessage renders answer / SourcePanel renders collapsible citations
+
+
+HEALTH CHECK FLOW (every 15 seconds)
+──────────────────────────────────────
+
+  App.jsx useEffect setInterval(15s)
+  → getBackendStatus() → GET /health
+  → sets backendStatus { online, groqConfigured, chromaDir }
+  → Sidebar.jsx StatusCards update
+
+
+MODULE DEPENDENCY MAP
+──────────────────────
+
+  REACT (HTTP only — no Python imports)
+    App.jsx → Sidebar, RepoSetup, ChatWindow
+    ChatWindow → ChatMessage, LoadingDots
+    ChatMessage → SourcePanel
+    RepoSetup → apiClient.ingestRepository, repoUtils
+    apiClient.js → axios, VITE_API_BASE_URL
+
+  FASTAPI (Python)
+    api/main.py → routes/health, routes/query
+    routes/query → core/rag_engine
+    core/rag_engine → config/settings, embedder, vector_store, llm_client
+    core/llm_client → config/settings, groq SDK
+    core/embedder → sentence_transformers
+    core/vector_store → chromadb
+    config/settings → pydantic_settings (.env file)
+
+
+WEEK-BY-WEEK BUILD HISTORY
+────────────────────────────
+
+  Week 1  repo_parser, github_ingester, code_chunker (basic)
+  Week 2  code_chunker (JS+metadata), file_utils, export/validate scripts
+  Week 3  embedder, vector_store, build_index, semantic_search scripts
+  Week 4  config/settings, llm_client, rag_engine, FastAPI api/ layer
+  Week 5  frontend/ (React+Vite+Tailwind, 18 files), test_frontend_api.py
+
+================================================================================

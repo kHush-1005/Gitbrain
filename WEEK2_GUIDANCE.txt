@@ -1,0 +1,416 @@
+
+================================================================================
+  GitBrain — Week 2 Implementation Guidance
+  Beginner-Friendly Mentor Guide
+================================================================================
+  Phase:   Week 2 — Improve Chunking + Export to JSONL + Tests + Validation
+  Stack:   Python · GitHub REST API · ast module · pytest · JSONL
+  Status:  Builds directly on top of Week 1
+================================================================================
+
+
+────────────────────────────────────────────────────────────────────────────────
+WHAT CHANGED FROM WEEK 1 TO WEEK 2
+────────────────────────────────────────────────────────────────────────────────
+
+Week 1 built a working pipeline that:
+  → Fetched files from GitHub
+  → Chunked Python files using AST
+  → Printed chunks to the terminal
+
+Week 2 improves EVERY LAYER and adds persistence:
+
+  LAYER 1: GitHub Ingestion (github_ingester.py)
+    + Custom exceptions (RepoNotFoundError, GitHubRateLimitError, GitHubAPIError)
+    + Retry logic with exponential backoff (up to 3 attempts per file)
+    + Returns summary dict alongside files list
+    + More language mappings in detect_language()
+
+  LAYER 2: Code Chunking (code_chunker.py)
+    + NEW: chunk_javascript_like_file() — heuristic chunker for JS/TS/Java/Go/Rust/C/C++
+    + NEW: MAX_CHUNK_CHARS limit — oversized chunks are automatically split further
+    + NEW: char_count and token_estimate fields on every chunk
+    + NEW: repo_name field embedded in chunks when provided
+    + Better window sizes: 60 lines for code, 40 lines for text/YAML/Markdown
+    + CRLF line ending normalization
+
+  LAYER 3: Data Persistence (NEW)
+    + utils/file_utils.py — save and load JSONL and JSON files
+    + scripts/export_chunks.py — full pipeline script that saves to disk
+    + data/chunks/ directory — where JSONL files are stored
+
+  LAYER 4: Quality Assurance (NEW)
+    + scripts/validate_chunks.py — 8 automated checks on the JSONL file
+    + tests/test_chunker.py — 25 pytest tests for the chunker
+    + tests/test_repo_parser.py — 15 pytest tests for URL parsing
+
+
+────────────────────────────────────────────────────────────────────────────────
+UPDATED FILE STRUCTURE
+────────────────────────────────────────────────────────────────────────────────
+
+gitbrain/
+│
+├── core/
+│   ├── __init__.py
+│   ├── github_ingester.py       ← UPDATED: exceptions, retry, summary return
+│   └── code_chunker.py          ← UPDATED: JS chunker, size limits, richer metadata
+│
+├── utils/
+│   ├── __init__.py
+│   ├── repo_parser.py           ← unchanged from Week 1
+│   └── file_utils.py            ← NEW: save/load JSONL + JSON helpers
+│
+├── data/
+│   └── chunks/
+│       └── .gitkeep             ← keeps the folder in Git
+│       └── (JSONL files go here after running export_chunks.py)
+│
+├── tests/
+│   ├── __init__.py
+│   ├── test_chunker.py          ← NEW: 25 tests for code_chunker
+│   └── test_repo_parser.py      ← NEW: 15 tests for repo_parser
+│
+├── scripts/
+│   ├── export_chunks.py         ← NEW: fetch → chunk → save JSONL
+│   └── validate_chunks.py       ← NEW: 8 quality checks on JSONL file
+│
+├── test_ingester.py             ← UPDATED: uses new chunker + summary
+├── requirements.txt             ← UPDATED: added pytest
+├── .env.example                 ← unchanged
+├── .gitignore                   ← unchanged
+└── WEEK2_GUIDANCE.txt           ← THIS FILE
+
+
+────────────────────────────────────────────────────────────────────────────────
+HOW TO INSTALL DEPENDENCIES
+────────────────────────────────────────────────────────────────────────────────
+
+WINDOWS:
+  venv\Scripts\activate
+  pip install -r requirements.txt
+
+MAC / LINUX:
+  source venv/bin/activate
+  pip install -r requirements.txt
+
+New in Week 2: pytest is added to requirements.txt
+Verify: python -c "import pytest; print('pytest OK')"
+
+
+────────────────────────────────────────────────────────────────────────────────
+HOW TO RUN WEEK 2 — STEP BY STEP
+────────────────────────────────────────────────────────────────────────────────
+
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │  STEP 1: Run the quick test (same command as Week 1, works as-is)        │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+  python test_ingester.py https://github.com/psf/requests
+
+  What it does:
+    → Parses URL
+    → Fetches files from GitHub API
+    → Chunks all files with updated chunker (now includes JS heuristic)
+    → Prints 20 sample chunks with char_count and token_estimate
+    → Shows Week 2 validation summary
+
+  Optional: save chunks from test_ingester.py directly:
+    python test_ingester.py https://github.com/psf/requests --save
+
+
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │  STEP 2: Export chunks to disk (the main Week 2 script)                  │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+  python scripts/export_chunks.py https://github.com/psf/requests
+
+  What it does:
+    → Fetches all files from GitHub (up to 500 by default)
+    → Chunks every file
+    → Saves result to: data/chunks/psf__requests_chunks.jsonl
+    → Saves summary to: data/chunks/psf__requests_summary.json
+    → Prints chunk type breakdown, language breakdown, size statistics
+
+  For a larger repo with more files:
+    python scripts/export_chunks.py https://github.com/tiangolo/fastapi --max-files 300
+
+  After this step, open data/chunks/ and you should see the JSONL file.
+  JSONL = JSON Lines = one JSON object per line. Open it in any text editor.
+
+
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │  STEP 3: Validate the JSONL file                                         │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+  python scripts/validate_chunks.py data/chunks/psf__requests_chunks.jsonl
+
+  What it checks:
+    1. Required fields present on all chunks
+    2. No chunks with empty text
+    3. Valid line numbers (start_line >= 1, end_line >= start_line)
+    4. No oversized chunks (> 512 token estimate)
+    5. No duplicate chunk IDs
+    6. Chunk type distribution (how many function/class/method/window)
+    7. Language distribution
+    8. File coverage (how many files are represented)
+
+  If all checks pass: "✓ CHUNKS ARE READY FOR WEEK 3 EMBEDDING"
+  If issues found:    "✗ CRITICAL ISSUES FOUND" with details on what to fix
+
+
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │  STEP 4: Run pytest tests                                                │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+  pytest tests/ -v
+
+  What it tests:
+    tests/test_repo_parser.py   — URL parsing edge cases
+    tests/test_chunker.py       — Python AST, JS heuristic, fallback, metadata
+
+  Expected output:
+    tests/test_repo_parser.py::TestParseGithubUrl::test_standard_https_url PASSED
+    tests/test_chunker.py::TestPythonFunctionExtraction::test_extracts_one_function PASSED
+    ...
+    35 passed in 0.8s
+
+  If any test fails:
+    Read the assertion error carefully.
+    It will point to the exact function and expected vs actual value.
+
+
+────────────────────────────────────────────────────────────────────────────────
+EXECUTION FLOW OF ALL FILES
+────────────────────────────────────────────────────────────────────────────────
+
+FLOW 1: export_chunks.py (the main pipeline)
+
+  scripts/export_chunks.py
+      │
+      ├── 1. utils/repo_parser.py → parse_github_url()
+      │         "https://github.com/psf/requests"
+      │         → owner="psf", repo="requests"
+      │
+      ├── 2. core/github_ingester.py → fetch_repository_files()
+      │         → get_headers() (token from .env)
+      │         → fetch_file_tree() → 3 GitHub API calls → list of file paths
+      │         → should_skip_file() → filter out binaries/large files
+      │         → fetch_file_content() → base64 decode each file
+      │         → detect_language() → assign language per file
+      │         → returns (files_list, summary_dict)
+      │
+      ├── 3. core/code_chunker.py → chunk_all_files()
+      │         for each file:
+      │           → chunk_file() picks strategy based on language:
+      │             python     → chunk_python_file() via ast.parse()
+      │             js/ts/java → chunk_javascript_like_file() via regex
+      │             yaml/md    → fallback_chunk_text() small window (40 lines)
+      │             other      → fallback_chunk_text() code window (60 lines)
+      │           → _split_oversized_chunks() if any chunk > 512 tokens
+      │         → returns flat list of all chunk dicts
+      │
+      └── 4. utils/file_utils.py → save_jsonl() + save_json()
+                → data/chunks/psf__requests_chunks.jsonl  (one chunk per line)
+                → data/chunks/psf__requests_summary.json  (stats)
+
+
+FLOW 2: validate_chunks.py
+
+  scripts/validate_chunks.py
+      │
+      └── utils/file_utils.py → load_jsonl()
+              → reads data/chunks/psf__requests_chunks.jsonl
+              → runs 8 quality checks
+              → prints report
+              → exits 0 (success) or 1 (critical issues found)
+
+
+FLOW 3: pytest
+
+  pytest tests/
+      │
+      ├── tests/test_repo_parser.py
+      │     → imports utils/repo_parser.parse_github_url()
+      │     → tests normal URLs, edge cases, invalid inputs
+      │
+      └── tests/test_chunker.py
+            → imports core/code_chunker.*
+            → tests Python AST extraction
+            → tests JS heuristic chunking
+            → tests fallback window chunking
+            → tests metadata completeness on all chunk types
+
+
+────────────────────────────────────────────────────────────────────────────────
+WHAT EACH FILE DOES (WEEK 2 ADDITIONS)
+────────────────────────────────────────────────────────────────────────────────
+
+utils/file_utils.py
+  A utility module for reading and writing chunk data.
+  Key functions:
+    ensure_dir(path)         — create directory if missing (safe to call twice)
+    save_jsonl(chunks, path) — write list of dicts as JSONL (one dict per line)
+    load_jsonl(path)         — read JSONL back into list of dicts
+    save_json(data, path)    — write dict/list as human-readable JSON
+    sanitize_repo_name(o, r) — "my-org", "my-repo" → "my_org__my_repo"
+    get_chunk_file_path(o,r) — returns standard JSONL path for a repo
+
+scripts/export_chunks.py
+  The main Week 2 command. Full pipeline: fetch → chunk → save JSONL.
+  Accepts --max-files flag for large repos.
+  Prints full statistics (chunk type breakdown, language breakdown, sizes).
+
+scripts/validate_chunks.py
+  Reads a JSONL chunk file and runs 8 quality checks.
+  Tells you if chunks are ready for Week 3.
+  Returns exit code 1 if critical issues found (useful for CI/CD later).
+
+tests/test_repo_parser.py
+  15 pytest test cases for parse_github_url() and make_collection_name().
+  Covers normal URLs, edge cases (trailing slash, .git), and invalid inputs.
+
+tests/test_chunker.py
+  25 pytest test cases covering:
+    - Python function/class/method extraction
+    - JavaScript heuristic chunking
+    - YAML/text fallback sliding window chunking
+    - Required metadata on every chunk type
+    - Chunk size limits
+    - Edge cases: empty file, syntax error, CRLF line endings
+
+
+────────────────────────────────────────────────────────────────────────────────
+HOW WEEK 2 PREPARES FOR WEEK 3
+────────────────────────────────────────────────────────────────────────────────
+
+After Week 2 is complete, you have:
+  ✓ data/chunks/{repo}_chunks.jsonl  — clean, validated chunk data on disk
+  ✓ Every chunk has: text, file_path, language, chunk_name, start_line, end_line
+  ✓ Every chunk has: char_count, token_estimate (ready for embedding size checks)
+  ✓ No oversized chunks (all ≤ 512 token estimate)
+  ✓ No empty text chunks
+
+Week 3 builds on this:
+  1. Install: pip install sentence-transformers chromadb
+  2. Build core/embedder.py
+       → loads sentence-transformers model "all-MiniLM-L6-v2"
+       → reads chunks from JSONL
+       → calls model.encode(chunk["text"]) for each chunk
+       → returns a 384-dimensional float vector per chunk
+  3. Build core/vector_store.py
+       → creates a ChromaDB collection named after the repo
+       → upserts each chunk: text + vector + metadata
+       → exposes similarity_search() for querying
+  4. Build scripts/build_index.py
+       → reads JSONL chunks
+       → embeds them with embedder
+       → stores in ChromaDB
+       → confirms collection.count() matches chunk count
+
+
+────────────────────────────────────────────────────────────────────────────────
+COMMON ERRORS AND FIXES
+────────────────────────────────────────────────────────────────────────────────
+
+ERROR: ModuleNotFoundError: No module named 'pytest'
+  FIX: pip install -r requirements.txt  (pytest is now in requirements.txt)
+
+ERROR: FileNotFoundError when running validate_chunks.py
+  FIX: Run export_chunks.py first to create the JSONL file.
+       python scripts/export_chunks.py https://github.com/psf/requests
+
+ERROR: 0 chunks generated by export_chunks.py
+  FIX: All files may have been filtered. Try a repo with Python/JS code.
+       Increase --max-files if repo has many files:
+       python scripts/export_chunks.py https://github.com/tiangolo/fastapi --max-files 300
+
+ERROR: pytest: command not found
+  FIX: Virtual environment is not activated.
+       Windows: venv\Scripts\activate
+       Mac/Linux: source venv/bin/activate
+       Then: pytest tests/ -v
+
+ERROR: RuntimeError / RepoNotFoundError
+  FIX: Double-check the repo URL. Is it public? Is the name exact?
+       Try: python test_ingester.py https://github.com/psf/requests
+
+ERROR: Validation warns "X chunks oversized"
+  FIX: This is a warning, not a critical error. The chunker already applies
+       _split_oversized_chunks(), so true oversized chunks should be rare.
+       If many are oversized, reduce MAX_CHUNK_CHARS in code_chunker.py.
+
+ERROR: JSONL file created but looks empty
+  FIX: Open the file in a text editor. It should have one JSON line per chunk.
+       If file size is 0 bytes, the chunker returned 0 chunks.
+       Run: python test_ingester.py <repo_url> first to diagnose.
+
+ERROR: Test fails with "AssertionError: repo_name not in chunk"
+  FIX: Make sure you are calling chunk_file(..., repo_name="something")
+       or chunk_all_files(files, repo_name="owner__repo").
+       The test checks that repo_name is absent when NOT provided.
+
+
+────────────────────────────────────────────────────────────────────────────────
+WEEK 2 VALIDATION CHECKLIST
+────────────────────────────────────────────────────────────────────────────────
+
+After completing Week 2, verify all of these:
+
+  □ pip install -r requirements.txt installs requests, python-dotenv, pytest
+  □ python test_ingester.py <url> still works (backward compatible with Week 1)
+  □ python scripts/export_chunks.py <url> creates a .jsonl in data/chunks/
+  □ The JSONL file contains at least 1 line per code file in the repo
+  □ Every line in the JSONL has: text, file_path, chunk_name, chunk_type,
+    start_line, end_line, char_count, token_estimate
+  □ python scripts/validate_chunks.py <jsonl> prints "READY FOR WEEK 3"
+  □ pytest tests/ -v shows all tests PASSED (no failures)
+  □ JS/TS files produce chunks with chunk_type="heuristic_block"
+  □ Python files still produce function/class/method chunks
+  □ No chunk has token_estimate > 512
+
+
+────────────────────────────────────────────────────────────────────────────────
+WHAT NOT TO BUILD IN WEEK 2
+────────────────────────────────────────────────────────────────────────────────
+
+  ✗ DO NOT install or use ChromaDB — that is Week 3
+  ✗ DO NOT install or use sentence-transformers — that is Week 3
+  ✗ DO NOT connect to Groq or any LLM — that is Week 4
+  ✗ DO NOT build FastAPI — that is Week 4
+  ✗ DO NOT build Streamlit frontend — that is Week 5
+  ✗ DO NOT add GitHub Actions — that is Week 6
+
+  The only goal of Week 2 is:
+    Improve chunks → Save them to JSONL → Validate them → Test the code.
+
+
+────────────────────────────────────────────────────────────────────────────────
+WEEK 3 PREVIEW
+────────────────────────────────────────────────────────────────────────────────
+
+After Week 2, the project has clean chunks stored in JSONL format.
+Week 3 will use these chunks to:
+
+  1. Generate vector embeddings:
+       from sentence_transformers import SentenceTransformer
+       model = SentenceTransformer("all-MiniLM-L6-v2")
+       vector = model.encode(chunk["text"])  # → array of 384 floats
+
+  2. Store vectors in ChromaDB:
+       import chromadb
+       client     = chromadb.PersistentClient(path="./chroma_db")
+       collection = client.get_or_create_collection("psf__requests")
+       collection.upsert(ids=[...], embeddings=[...], documents=[...])
+
+  3. Run semantic similarity search:
+       results = collection.query(query_embeddings=[query_vector], n_results=5)
+       # → returns 5 most semantically similar code chunks
+
+New packages to install in Week 3:
+  pip install sentence-transformers chromadb
+
+================================================================================
+  END OF WEEK 2 GUIDANCE
+  Build → Test → Validate → Move on to Week 3.
+================================================================================

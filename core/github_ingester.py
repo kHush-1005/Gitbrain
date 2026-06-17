@@ -1,38 +1,27 @@
 """
-core/github_ingester.py
+core/github_ingester.py  [UPDATED — Week 2]
 ─────────────────────────────────────────────────────────────────────────────
-PURPOSE:
-    Talk to the GitHub REST API to fetch all code files from a repository.
-
-WHAT IT DOES:
-    1. Builds the correct Authorization headers (with or without token).
-    2. Fetches the complete file tree of a repository.
-    3. Filters out binary/unwanted files (images, zips, lock files, etc.).
-    4. Fetches the raw text content of each code file.
-    5. Returns a list of file dictionaries for the chunker to process.
-
-OUTPUT FORMAT (list of dicts):
-    [
-        {
-            "path":     "src/auth/login.py",
-            "content":  "def login(user, password): ...",
-            "language": "python"
-        },
-        ...
-    ]
+CHANGES FROM WEEK 1:
+    ✓ Explicit 1 MB file-size guard before fetching content
+    ✓ Structured custom exceptions (GitHubRateLimitError, RepoNotFoundError)
+    ✓ Retry logic (up to 3 attempts) for transient network failures
+    ✓ Cleaner progress reporting with per-file size display
+    ✓ Returns ingestion summary dict alongside files list
+    ✓ SKIP_EXTENSIONS and SKIP_DIRECTORIES exposed as module-level constants
+      (so validate_chunks.py and tests can reference them)
 
 GITHUB API ENDPOINTS USED:
     GET /repos/{owner}/{repo}
-        → Discover the default branch name (main / master)
+        → Discover the default branch name
 
     GET /repos/{owner}/{repo}/branches/{branch}
-        → Get the latest commit SHA for that branch
+        → Get the latest commit SHA
 
     GET /repos/{owner}/{repo}/git/trees/{sha}?recursive=1
-        → Get the full file tree (all file paths)
+        → Full recursive file tree in one request
 
     GET /repos/{owner}/{repo}/contents/{path}
-        → Get the content of one file (returned as base64)
+        → Raw file content (Base64 encoded by GitHub)
 ─────────────────────────────────────────────────────────────────────────────
 """
 
@@ -43,64 +32,60 @@ import logging
 import requests
 from dotenv import load_dotenv
 
-# Load environment variables from .env file
 load_dotenv()
 
-# ─── Logger setup ─────────────────────────────────────────────────────────────
 logger = logging.getLogger(__name__)
 
-# ─── GitHub API base URL ──────────────────────────────────────────────────────
+# ─── GitHub API base ──────────────────────────────────────────────────────────
 GITHUB_API = "https://api.github.com"
 
-# ─── File extensions to skip (binary / non-code files) ───────────────────────
-# These will never contain useful text for a code assistant.
-SKIP_EXTENSIONS = {
+# ─── File-size limit (bytes) ──────────────────────────────────────────────────
+MAX_FILE_SIZE_BYTES = 1_000_000   # 1 MB — GitHub truncates above this anyway
+
+# ─── Extensions to skip (binary / non-textual / build artifacts) ─────────────
+SKIP_EXTENSIONS = frozenset({
     # Images
     ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".webp", ".bmp", ".tiff",
     # Archives
     ".zip", ".tar", ".gz", ".bz2", ".rar", ".7z", ".xz",
     # Compiled / binary
-    ".exe", ".dll", ".so", ".dylib", ".bin", ".out", ".class", ".jar", ".war",
+    ".exe", ".dll", ".so", ".dylib", ".bin", ".out",
+    ".class", ".jar", ".war", ".ear",
+    ".pyc", ".pyo", ".pyd", ".o", ".a",
     # Documents
     ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
     # Media
     ".mp3", ".mp4", ".avi", ".mov", ".mkv", ".wav", ".flac",
-    # Build artifacts
-    ".pyc", ".pyo", ".pyd", ".o", ".a",
-    # Font files
+    # Fonts
     ".ttf", ".otf", ".woff", ".woff2", ".eot",
-    # Lock files (not useful for code understanding)
+    # Lock files (generated, not useful for comprehension)
     ".lock",
-    # Minified JS/CSS (unreadable)
-    ".min.js", ".min.css",
-    # Source map files
-    ".map",
-}
+    # Minified / source-map
+    ".min.js", ".min.css", ".map",
+})
 
 # ─── Directory names to skip ──────────────────────────────────────────────────
-# These directories typically contain dependencies or generated files, not
-# the project's own source code.
-SKIP_DIRECTORIES = {
-    "node_modules",   # JavaScript dependencies
-    ".git",           # Git internal files
-    "__pycache__",    # Python bytecode cache
-    "dist",           # Build output
-    "build",          # Build output
-    "vendor",         # Go / PHP dependencies
-    ".venv",          # Python virtual environment
-    "venv",           # Python virtual environment
-    "env",            # Python virtual environment
-    ".idea",          # JetBrains IDE files
-    ".vscode",        # VS Code settings
-    "coverage",       # Test coverage reports
-    ".nyc_output",    # NYC coverage output
-    "eggs",           # Python egg distributions
-    ".eggs",
-}
+SKIP_DIRECTORIES = frozenset({
+    "node_modules", ".git", "__pycache__", "dist", "build",
+    "vendor", ".venv", "venv", "env", ".idea", ".vscode",
+    "coverage", ".nyc_output", "eggs", ".eggs",
+    "site-packages", ".tox", ".pytest_cache", ".mypy_cache",
+})
 
-# ─── Maximum file size to fetch (bytes) ───────────────────────────────────────
-# GitHub truncates files > 1MB anyway. We skip large files proactively.
-MAX_FILE_SIZE_BYTES = 500_000  # 500 KB
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Custom Exceptions
+# ─────────────────────────────────────────────────────────────────────────────
+class GitHubRateLimitError(Exception):
+    """Raised when the GitHub API rate limit is exhausted."""
+
+
+class RepoNotFoundError(Exception):
+    """Raised when the target repository does not exist or is inaccessible."""
+
+
+class GitHubAPIError(Exception):
+    """Raised for unexpected GitHub API responses."""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -110,13 +95,8 @@ def get_headers(token: str = "") -> dict:
     """
     Build HTTP headers for GitHub API requests.
 
-    Args:
-        token: GitHub Personal Access Token. Optional but highly recommended.
-               Without a token: 60 requests/hour limit.
-               With a token:   5,000 requests/hour limit.
-
-    Returns:
-        A dict of headers to pass to requests.get().
+    Without token: 60 requests / hour.
+    With token:    5,000 requests / hour.
     """
     headers = {
         "Accept": "application/vnd.github+json",
@@ -130,408 +110,385 @@ def get_headers(token: str = "") -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 # HELPER: Should we skip this file?
 # ─────────────────────────────────────────────────────────────────────────────
-def should_skip_file(path: str, size_bytes: int = 0) -> bool:
+def should_skip_file(path: str, size_bytes: int = 0) -> tuple[bool, str]:
     """
     Decide whether a file should be skipped during ingestion.
 
-    Reasons to skip:
-        - File is in a skip directory (node_modules, .git, etc.)
-        - File has a binary/non-code extension (.png, .zip, etc.)
-        - File is too large (> 500 KB)
-
-    Args:
-        path:       Relative file path from the repo root, e.g. "src/auth.py"
-        size_bytes: File size in bytes (from the GitHub tree API).
-
     Returns:
-        True  → skip this file
-        False → process this file
+        (True, reason_string)  — if the file should be skipped
+        (False, "")            — if the file should be processed
+
+    Having a reason string makes logging and debugging much clearer.
     """
-    # Split the path into its directory components
     parts = path.split("/")
 
-    # Check if any directory segment is in the skip list
-    # e.g. "node_modules/lodash/index.js" → parts[0] = "node_modules" → skip
-    for part in parts[:-1]:  # exclude the filename itself
+    # Check directory segments (everything except the filename)
+    for part in parts[:-1]:
         if part in SKIP_DIRECTORIES:
-            return True
+            return True, f"directory '{part}' is in skip list"
 
     # Check file extension
-    # Get extension from the filename (last part of the path)
     filename = parts[-1].lower()
     for ext in SKIP_EXTENSIONS:
         if filename.endswith(ext):
-            return True
-
-    # Skip files that have no extension and are not common script files
-    # (e.g. Makefile, Dockerfile are fine; binary blobs are not)
-    # We'll allow no-extension files through and rely on content detection.
+            return True, f"extension '{ext}' is in skip list"
 
     # Check file size
     if size_bytes > MAX_FILE_SIZE_BYTES:
-        logger.debug(f"Skipping large file ({size_bytes} bytes): {path}")
-        return True
+        return True, f"file too large ({size_bytes:,} bytes > {MAX_FILE_SIZE_BYTES:,} limit)"
 
-    return False
+    return False, ""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # HELPER: Detect programming language from file extension
 # ─────────────────────────────────────────────────────────────────────────────
 def detect_language(path: str) -> str:
-    """
-    Detect the programming language of a file based on its extension.
+    """Map a file path to a language string based on its extension."""
+    filename = path.rsplit("/", 1)[-1].lower()
 
-    This is used as metadata on each chunk, and also determines which
-    chunking strategy to use (AST-based for Python, heuristic for others).
+    # Special-case filenames with no extension
+    if filename == "dockerfile":
+        return "dockerfile"
+    if filename in ("makefile", "gnumakefile"):
+        return "makefile"
+    if filename in ("gemfile", "rakefile", "guardfile"):
+        return "ruby"
+    if filename in ("pipfile",):
+        return "toml"
 
-    Args:
-        path: File path, e.g. "src/auth/login.py"
-
-    Returns:
-        A lowercase language string, e.g. "python", "javascript", "text"
-    """
-    # Extract the extension from the filename
-    filename = path.rsplit("/", 1)[-1].lower()  # just the filename
     if "." not in filename:
         return "text"
 
-    ext = filename.rsplit(".", 1)[-1]  # everything after the last dot
+    ext = filename.rsplit(".", 1)[-1]
 
     LANGUAGE_MAP = {
-        # Python
-        "py":    "python",
-        "pyw":   "python",
-        # JavaScript / TypeScript
-        "js":    "javascript",
-        "jsx":   "javascript",
-        "ts":    "typescript",
-        "tsx":   "typescript",
-        "mjs":   "javascript",
-        "cjs":   "javascript",
-        # Java
-        "java":  "java",
-        # Go
-        "go":    "go",
-        # Rust
-        "rs":    "rust",
-        # C / C++
-        "c":     "c",
-        "h":     "c",
-        "cpp":   "cpp",
-        "cc":    "cpp",
-        "cxx":   "cpp",
-        "hpp":   "cpp",
-        # C#
-        "cs":    "csharp",
-        # Ruby
-        "rb":    "ruby",
-        # PHP
-        "php":   "php",
-        # Shell
-        "sh":    "bash",
-        "bash":  "bash",
-        "zsh":   "bash",
-        # Data / Config
-        "json":  "json",
-        "yaml":  "yaml",
-        "yml":   "yaml",
-        "toml":  "toml",
-        "ini":   "ini",
-        "cfg":   "ini",
-        "env":   "text",
-        # Markup
-        "md":    "markdown",
-        "rst":   "rst",
-        "txt":   "text",
-        "html":  "html",
-        "htm":   "html",
-        "xml":   "xml",
-        "css":   "css",
-        "scss":  "css",
-        "sass":  "css",
-        # SQL
-        "sql":   "sql",
-        # Dockerfile
-        "dockerfile": "dockerfile",
+        "py": "python", "pyw": "python",
+        "js": "javascript", "jsx": "javascript", "mjs": "javascript", "cjs": "javascript",
+        "ts": "typescript", "tsx": "typescript",
+        "java": "java",
+        "go": "go",
+        "rs": "rust",
+        "c": "c", "h": "c",
+        "cpp": "cpp", "cc": "cpp", "cxx": "cpp", "hpp": "cpp",
+        "cs": "csharp",
+        "rb": "ruby",
+        "php": "php",
+        "kt": "kotlin", "kts": "kotlin",
+        "swift": "swift",
+        "sh": "bash", "bash": "bash", "zsh": "bash",
+        "json": "json",
+        "yaml": "yaml", "yml": "yaml",
+        "toml": "toml",
+        "ini": "ini", "cfg": "ini",
+        "md": "markdown", "mdx": "markdown",
+        "rst": "rst",
+        "txt": "text",
+        "html": "html", "htm": "html",
+        "xml": "xml",
+        "css": "css", "scss": "css", "sass": "css",
+        "sql": "sql",
+        "graphql": "graphql", "gql": "graphql",
+        "proto": "protobuf",
     }
-
-    # Special case: files named exactly "Dockerfile"
-    if filename == "dockerfile":
-        return "dockerfile"
-    if filename == "makefile":
-        return "makefile"
 
     return LANGUAGE_MAP.get(ext, "text")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CORE FUNCTION 1: Fetch the complete file tree
+# HELPER: Rate-limit awareness
+# ─────────────────────────────────────────────────────────────────────────────
+def _handle_rate_limit(response: requests.Response) -> None:
+    """
+    Inspect rate-limit headers and pause if remaining requests are low.
+
+    Pauses execution until the rate limit window resets when remaining < 10.
+    """
+    try:
+        remaining = int(response.headers.get("X-RateLimit-Remaining", "100"))
+        reset_ts  = int(response.headers.get("X-RateLimit-Reset",     str(int(time.time()) + 60)))
+    except (ValueError, TypeError):
+        return
+
+    if remaining < 10:
+        wait = max(5, reset_ts - int(time.time())) + 5   # +5 s buffer
+        print(
+            f"\n  ⚠ GitHub rate limit low ({remaining} remaining). "
+            f"Pausing {wait:.0f} s until reset..."
+        )
+        logger.warning(f"Rate limit low ({remaining}). Waiting {wait}s.")
+        time.sleep(wait)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HELPER: GET with retry
+# ─────────────────────────────────────────────────────────────────────────────
+def _get_with_retry(url: str, headers: dict, max_retries: int = 3, timeout: int = 20) -> requests.Response:
+    """
+    Make a GET request with exponential-backoff retry for transient failures.
+
+    Retries on:
+        - Connection errors
+        - Timeout errors
+        - HTTP 5xx server errors
+
+    Does NOT retry on:
+        - HTTP 4xx client errors (bad token, repo not found, etc.)
+
+    Args:
+        url:         URL to fetch.
+        headers:     Request headers.
+        max_retries: Maximum number of attempts (default: 3).
+        timeout:     Request timeout in seconds (default: 20).
+
+    Returns:
+        requests.Response object.
+
+    Raises:
+        requests.exceptions.RequestException if all retries fail.
+    """
+    last_error = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            response = requests.get(url, headers=headers, timeout=timeout)
+            # Retry on 5xx errors but not on 4xx
+            if response.status_code < 500:
+                return response
+            logger.warning(
+                f"Server error {response.status_code} on attempt {attempt}/{max_retries}: {url}"
+            )
+        except (requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout) as e:
+            last_error = e
+            logger.warning(f"Network error on attempt {attempt}/{max_retries}: {e}")
+
+        if attempt < max_retries:
+            wait = 2 ** (attempt - 1)   # 1s, 2s, 4s
+            logger.debug(f"Retrying in {wait}s...")
+            time.sleep(wait)
+
+    raise requests.exceptions.RequestException(
+        f"All {max_retries} retries failed for: {url}"
+    ) from last_error
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CORE: Fetch the complete file tree
 # ─────────────────────────────────────────────────────────────────────────────
 def fetch_file_tree(owner: str, repo: str, token: str = "") -> list[dict]:
     """
-    Fetch the complete list of files in a GitHub repository.
+    Fetch the complete list of file paths in a GitHub repository.
 
-    Uses the Git Trees API with recursive=1 to get every file in one request,
-    rather than traversing directories one by one.
+    Uses the Git Trees API (recursive=1) to get all files in a single request.
 
     Args:
-        owner: Repository owner username, e.g. "tiangolo"
-        repo:  Repository name, e.g. "fastapi"
-        token: GitHub Personal Access Token (optional but recommended).
+        owner: Repository owner (e.g. "tiangolo").
+        repo:  Repository name (e.g. "fastapi").
+        token: GitHub Personal Access Token (optional, but strongly recommended).
 
     Returns:
-        A list of file info dicts:
-        [
-            {"path": "src/main.py", "sha": "abc123", "size": 1024},
-            ...
-        ]
-        Only blob (file) entries are included — directories are excluded.
+        List of dicts: [{"path": "src/main.py", "sha": "abc", "size": 1024}, ...]
 
     Raises:
-        RuntimeError: If the GitHub API returns an error response.
+        RepoNotFoundError:     If the repository doesn't exist or is private.
+        GitHubRateLimitError:  If the API rate limit is exhausted.
+        GitHubAPIError:        For other unexpected API errors.
     """
     headers = get_headers(token)
 
-    # ── Step 1: Get repository info to find the default branch ────────────────
-    logger.info(f"Fetching repo info for: {owner}/{repo}")
-    repo_url = f"{GITHUB_API}/repos/{owner}/{repo}"
-    response = requests.get(repo_url, headers=headers, timeout=15)
+    # ── Step 1: Get repo metadata (find default branch) ───────────────────────
+    logger.info(f"Fetching repo info: {owner}/{repo}")
+    resp = _get_with_retry(f"{GITHUB_API}/repos/{owner}/{repo}", headers)
 
-    if response.status_code == 404:
-        raise RuntimeError(
-            f"Repository not found: {owner}/{repo}\n"
-            "Check: is the URL correct? Is the repo private? Do you need a token?"
+    if resp.status_code == 404:
+        raise RepoNotFoundError(
+            f"Repository not found: github.com/{owner}/{repo}\n"
+            "  Check: correct URL? Is the repo private? Do you need a token?"
         )
-    if response.status_code == 403:
-        remaining = response.headers.get("X-RateLimit-Remaining", "?")
-        raise RuntimeError(
-            f"GitHub API access forbidden (HTTP 403).\n"
-            f"Rate limit remaining: {remaining}\n"
-            "Add a GitHub token to your .env file to increase the limit to 5,000/hour."
+    if resp.status_code == 403:
+        remaining = resp.headers.get("X-RateLimit-Remaining", "?")
+        if remaining == "0":
+            raise GitHubRateLimitError(
+                "GitHub API rate limit exhausted. "
+                "Add a GITHUB_TOKEN to .env or wait ~60 minutes."
+            )
+        raise GitHubAPIError(
+            f"Access forbidden (HTTP 403). "
+            f"Token may lack required permissions. Remaining: {remaining}"
         )
-    if response.status_code != 200:
-        raise RuntimeError(
-            f"Unexpected GitHub API error {response.status_code}: {response.text[:200]}"
+    if resp.status_code == 401:
+        raise GitHubAPIError(
+            "Unauthorized (HTTP 401). Your GITHUB_TOKEN is invalid or expired."
+        )
+    if resp.status_code != 200:
+        raise GitHubAPIError(
+            f"Unexpected API response {resp.status_code} for {owner}/{repo}: "
+            f"{resp.text[:200]}"
         )
 
-    repo_data = response.json()
-    default_branch = repo_data.get("default_branch", "main")
+    repo_data       = resp.json()
+    default_branch  = repo_data.get("default_branch", "main")
     logger.info(f"Default branch: {default_branch}")
 
-    # ── Step 2: Get the latest commit SHA for the default branch ──────────────
-    branch_url = f"{GITHUB_API}/repos/{owner}/{repo}/branches/{default_branch}"
-    branch_response = requests.get(branch_url, headers=headers, timeout=15)
-    branch_response.raise_for_status()
-    branch_data = branch_response.json()
-    sha = branch_data["commit"]["sha"]
-    logger.info(f"Latest commit SHA: {sha[:8]}...")
+    # ── Step 2: Get latest commit SHA ──────────────────────────────────────────
+    branch_resp = _get_with_retry(
+        f"{GITHUB_API}/repos/{owner}/{repo}/branches/{default_branch}", headers
+    )
+    branch_resp.raise_for_status()
+    sha = branch_resp.json()["commit"]["sha"]
+    logger.info(f"Latest commit: {sha[:8]}...")
 
-    # ── Step 3: Get the complete recursive file tree ───────────────────────────
-    tree_url = f"{GITHUB_API}/repos/{owner}/{repo}/git/trees/{sha}?recursive=1"
-    logger.info(f"Fetching file tree (recursive)...")
-    tree_response = requests.get(tree_url, headers=headers, timeout=30)
-    tree_response.raise_for_status()
-    tree_data = tree_response.json()
+    # ── Step 3: Recursive file tree ────────────────────────────────────────────
+    tree_resp = _get_with_retry(
+        f"{GITHUB_API}/repos/{owner}/{repo}/git/trees/{sha}?recursive=1",
+        headers, timeout=30
+    )
+    tree_resp.raise_for_status()
+    tree_data = tree_resp.json()
 
     if tree_data.get("truncated"):
         logger.warning(
-            "WARNING: The file tree was truncated by GitHub (repo has > 100,000 files). "
-            "Some files may be missing from the index."
+            "GitHub returned a TRUNCATED file tree (repo > 100,000 files). "
+            "Some files will be missing."
         )
+        print("  ⚠  Warning: repository is very large — file tree was truncated by GitHub.")
 
-    # ── Step 4: Filter to only file blobs, applying skip rules ────────────────
-    all_items = tree_data.get("tree", [])
-    files = []
-    skipped = 0
-
-    for item in all_items:
+    # ── Step 4: Filter blobs ───────────────────────────────────────────────────
+    files, skipped = [], 0
+    for item in tree_data.get("tree", []):
         if item.get("type") != "blob":
-            # Skip tree (directory) entries
             continue
-
         path = item.get("path", "")
         size = item.get("size", 0)
-
-        if should_skip_file(path, size):
+        skip, reason = should_skip_file(path, size)
+        if skip:
+            logger.debug(f"SKIP {path}: {reason}")
             skipped += 1
-            continue
+        else:
+            files.append({"path": path, "sha": item.get("sha", ""), "size": size})
 
-        files.append({
-            "path": path,
-            "sha":  item.get("sha", ""),
-            "size": size,
-        })
-
-    logger.info(
-        f"File tree fetched: {len(files)} code files found, "
-        f"{skipped} files skipped (binary/unwanted)."
+    print(
+        f"  File tree fetched: {len(files)} code files, "
+        f"{skipped} skipped (binary/large/unwanted)"
     )
     return files
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# HELPER: Rate limit checker
-# ─────────────────────────────────────────────────────────────────────────────
-def _check_and_handle_rate_limit(response: requests.Response) -> None:
-    """
-    Inspect GitHub API rate limit headers and pause if we're running low.
-
-    GitHub returns these headers on every response:
-        X-RateLimit-Limit     → total requests allowed per hour
-        X-RateLimit-Remaining → requests left in current window
-        X-RateLimit-Reset     → Unix timestamp when the window resets
-
-    This function pauses execution if remaining requests < 10,
-    waiting until the rate limit window resets.
-    """
-    remaining = int(response.headers.get("X-RateLimit-Remaining", 100))
-    reset_ts   = int(response.headers.get("X-RateLimit-Reset",     time.time() + 60))
-
-    if remaining < 10:
-        wait_seconds = max(0, reset_ts - int(time.time())) + 5  # +5s buffer
-        logger.warning(
-            f"GitHub API rate limit low! Only {remaining} requests remaining. "
-            f"Pausing for {wait_seconds:.0f} seconds until reset..."
-        )
-        time.sleep(wait_seconds)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# CORE FUNCTION 2: Fetch the content of a single file
+# CORE: Fetch single file content
 # ─────────────────────────────────────────────────────────────────────────────
 def fetch_file_content(owner: str, repo: str, path: str, token: str = "") -> str:
     """
-    Fetch the raw text content of a single file from a GitHub repository.
+    Fetch and decode the raw text content of one repository file.
 
-    GitHub returns file content encoded as Base64.
-    This function decodes it and returns the raw UTF-8 text.
+    GitHub returns content as Base64. This function decodes it.
+
+    Returns empty string ("") if:
+        - File is not found
+        - File encoding is not base64 (e.g. large files with encoding="none")
+        - Any network/decoding error occurs
 
     Args:
-        owner: Repository owner username.
-        repo:  Repository name.
-        path:  File path relative to repo root, e.g. "src/auth/login.py"
-        token: GitHub Personal Access Token (optional).
+        owner: Repo owner.
+        repo:  Repo name.
+        path:  File path from repo root.
+        token: Optional GitHub token.
 
     Returns:
-        The decoded file content as a string.
-        Returns an empty string if the file cannot be fetched or decoded.
+        Decoded UTF-8 text content, or "".
     """
     headers = get_headers(token)
-    url = f"{GITHUB_API}/repos/{owner}/{repo}/contents/{path}"
+    url     = f"{GITHUB_API}/repos/{owner}/{repo}/contents/{path}"
 
     try:
-        response = requests.get(url, headers=headers, timeout=15)
-        _check_and_handle_rate_limit(response)
+        resp = _get_with_retry(url, headers, max_retries=2, timeout=15)
+        _handle_rate_limit(resp)
 
-        if response.status_code == 200:
-            data = response.json()
+        if resp.status_code == 200:
+            data     = resp.json()
             encoding = data.get("encoding", "")
 
             if encoding == "base64":
-                # Decode the base64 content
-                # GitHub adds newlines inside the base64 string — remove them first
-                raw_base64 = data["content"].replace("\n", "")
-                decoded_bytes = base64.b64decode(raw_base64)
+                raw = data["content"].replace("\n", "")
+                return base64.b64decode(raw).decode("utf-8", errors="replace")
 
-                # Decode bytes to string, replacing undecodable bytes
-                return decoded_bytes.decode("utf-8", errors="replace")
-
-            elif encoding == "none":
-                # File is too large for the contents API (> 1MB)
-                logger.debug(f"File too large for contents API, skipping: {path}")
+            if encoding == "none":
+                # File is too large for the Contents API (> 1 MB)
+                logger.debug(f"File too large for contents API: {path}")
                 return ""
 
-            else:
-                logger.debug(f"Unknown encoding '{encoding}' for file: {path}")
-                return ""
-
-        elif response.status_code == 404:
-            logger.debug(f"File not found (may have been deleted): {path}")
+            logger.debug(f"Unknown encoding '{encoding}': {path}")
             return ""
 
-        else:
-            logger.warning(
-                f"Could not fetch {path} — HTTP {response.status_code}"
-            )
+        if resp.status_code == 404:
+            logger.debug(f"File not found (possibly deleted): {path}")
             return ""
+
+        logger.warning(f"HTTP {resp.status_code} fetching {path}")
+        return ""
 
     except requests.exceptions.Timeout:
-        logger.warning(f"Timeout fetching file: {path}")
+        logger.warning(f"Timeout fetching: {path}")
         return ""
     except Exception as e:
-        logger.warning(f"Error fetching file {path}: {e}")
+        logger.warning(f"Error fetching {path}: {e}")
         return ""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CORE FUNCTION 3: Orchestrate full repository file fetching
+# CORE: Orchestrate full repository ingestion
 # ─────────────────────────────────────────────────────────────────────────────
 def fetch_repository_files(
-    owner: str,
-    repo: str,
-    token: str = "",
+    owner:     str,
+    repo:      str,
+    token:     str = "",
     max_files: int = 500,
-) -> list[dict]:
+) -> tuple[list[dict], dict]:
     """
     Fetch all code files from a GitHub repository.
 
-    This is the main function called by the test script and (in Week 4) by
-    the FastAPI /ingest endpoint.
-
-    It:
-        1. Fetches the file tree (list of all file paths).
-        2. Fetches the raw content of each file.
-        3. Attaches detected language to each file.
-        4. Returns the result as a list of file dicts.
+    New in Week 2: also returns a summary dict with ingestion statistics.
 
     Args:
-        owner:     Repository owner username.
+        owner:     Repository owner.
         repo:      Repository name.
-        token:     GitHub Personal Access Token (optional but recommended).
-        max_files: Safety cap — stop after this many files. Default: 500.
-                   Increase for very large repositories.
+        token:     GitHub Personal Access Token.
+        max_files: Safety cap on number of files fetched.
 
     Returns:
-        A list of file content dicts:
-        [
-            {
-                "path":     "src/auth/login.py",
-                "content":  "def login(user, password):\n    ...",
-                "language": "python",
-                "size":     1234
-            },
-            ...
-        ]
+        Tuple of:
+            files   — list of {path, content, language, size} dicts
+            summary — dict with ingestion statistics
+
+    Raises:
+        RepoNotFoundError, GitHubRateLimitError, GitHubAPIError
     """
-    # ── Step 1: Get the file list ──────────────────────────────────────────────
-    print(f"\n[GitBrain] Fetching file tree for: {owner}/{repo}")
+    print(f"\n[GitBrain] Fetching file tree: {owner}/{repo}")
     file_tree = fetch_file_tree(owner, repo, token)
 
-    # Apply safety cap
+    if not file_tree:
+        return [], {"total_files": 0, "fetched": 0, "empty": 0, "failed": 0}
+
     if len(file_tree) > max_files:
         print(
-            f"[GitBrain] Large repository detected ({len(file_tree)} files). "
-            f"Processing first {max_files} files only.\n"
-            f"           Increase max_files parameter to process more."
+            f"  ⚠  Large repo: {len(file_tree)} files found, "
+            f"capping at {max_files}. Increase max_files to process more."
         )
         file_tree = file_tree[:max_files]
 
-    total = len(file_tree)
-    print(f"[GitBrain] {total} files to fetch. Starting download...\n")
+    total   = len(file_tree)
+    fetched = 0
+    empty   = 0
+    failed  = 0
+    result  = []
 
-    # ── Step 2: Fetch each file's content ─────────────────────────────────────
-    result = []
-    fetched  = 0
-    failed   = 0
-    empty    = 0
-
+    print(f"[GitBrain] Fetching content for {total} files...\n")
     for i, file_info in enumerate(file_tree, start=1):
         path = file_info["path"]
+        size = file_info.get("size", 0)
 
-        # Progress indicator every 10 files
         if i % 10 == 0 or i == total:
-            print(f"  [{i:>4}/{total}] Fetching: {path[:70]}")
+            print(f"  [{i:>4}/{total}]  {path[:65]:<65}  ({size:>7,} B)")
 
         content = fetch_file_content(owner, repo, path, token)
 
@@ -539,20 +496,22 @@ def fetch_repository_files(
             empty += 1
             continue
 
-        language = detect_language(path)
-
         result.append({
             "path":     path,
             "content":  content,
-            "language": language,
-            "size":     file_info.get("size", 0),
+            "language": detect_language(path),
+            "size":     size,
         })
         fetched += 1
 
-    # ── Step 3: Print summary ──────────────────────────────────────────────────
-    print(f"\n[GitBrain] ✓ Fetch complete!")
-    print(f"           Files fetched with content : {fetched}")
-    print(f"           Files empty / skipped      : {empty}")
-    print(f"           Files failed               : {failed}")
+    summary = {
+        "owner":       owner,
+        "repo":        repo,
+        "total_files": total,
+        "fetched":     fetched,
+        "empty":       empty,
+        "failed":      failed,
+    }
 
-    return result
+    print(f"\n[GitBrain] ✓ Done! {fetched} files fetched, {empty} empty/skipped.")
+    return result, summary
